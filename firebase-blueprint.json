@@ -1,0 +1,52 @@
+{
+  "entities": {
+    "Item": {
+      "title": "Item",
+      "description": "An inventory asset like a weapon or gear.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "category": { "type": "string" },
+        "serial": { "type": "string" },
+        "popor": { "type": "string" },
+        "holder": { "type": "string" },
+        "note": { "type": "string" },
+        "status": { "type": "string", "enum": ["Di Gudang", "Keluar"] },
+        "date": { "type": "string" },
+        "customOverdueHours": { "type": "number" },
+        "outTimestamp": { "type": "number" },
+        "dueDate": { "type": "number" }
+      },
+      "required": ["id", "name", "category", "serial", "popor", "holder", "note", "status", "date"]
+    },
+    "Log": {
+      "title": "Log",
+      "description": "A transaction entry for inventory changes.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "status": { "type": "string" },
+        "type": { "type": "string" },
+        "holder": { "type": "string" },
+        "time": { "type": "string" },
+        "fullDate": { "type": "string" },
+        "operator": { "type": "string" },
+        "timestamp": { "type": "number" },
+        "sessionName": { "type": "string" }
+      },
+      "required": ["id", "name", "status", "type", "holder", "time", "fullDate", "operator", "timestamp"]
+    }
+  },
+  "firestore": {
+    "items/{itemId}": {
+      "schema": { "$ref": "Item" },
+      "description": "Stores all inventory items."
+    },
+    "logs/{logId}": {
+      "schema": { "$ref": "Log" },
+      "description": "Stores history logs for check-in and check-out events."
+    }
+  }
+}

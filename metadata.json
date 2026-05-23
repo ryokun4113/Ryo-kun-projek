@@ -1,0 +1,6 @@
+{
+  "name": "Sistem Gudang Senjata",
+  "description": "Sistem Kendali Inventaris Taktis dan manajemen aset gudang.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
