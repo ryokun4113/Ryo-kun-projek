@@ -1,6 +1,8 @@
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700;900&display=swap');
 @import "tailwindcss";
 
+@custom-variant dark (&:where(.dark, .dark *));
+
 @theme {
   --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
   --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
@@ -8,8 +10,7 @@
 
 body { 
     font-family: var(--font-sans); 
-    background-color: #020617; 
-    color: #e2e8f0; 
+    @apply bg-slate-50 dark:bg-[#020617] text-slate-900 dark:text-slate-200;
     overflow-x: hidden; 
     user-select: none; 
     -webkit-user-select: none; 
@@ -20,7 +21,7 @@ input, textarea { user-select: text; -webkit-user-select: text; }
 /* Background & Visual Effects */
 @keyframes radarPan { from { background-position: 0 0; } to { background-position: 40px 40px; } }
 .bg-radar { 
-    background-color: #020617; 
+    @apply bg-slate-50 dark:bg-[#020617];
     background-image: 
        radial-gradient(circle at 50% 50%, rgba(16, 185, 129, 0.08) 0%, transparent 60%),
        linear-gradient(rgba(16, 185, 129, 0.03) 1px, transparent 1px), 
@@ -34,6 +35,42 @@ input, textarea { user-select: text; -webkit-user-select: text; }
 .bg-cyber-mesh { background-image: radial-gradient(rgba(16, 185, 129, 0.15) 1px, transparent 1px); background-size: 10px 10px; }
 
 /* Animations */
+@keyframes jarvis-spin-slow {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+@keyframes jarvis-spin-reverse-slow {
+  0% { transform: rotate(360deg); }
+  100% { transform: rotate(0deg); }
+}
+@keyframes jarvis-pulse-glow {
+  0%, 100% { filter: drop-shadow(0 0 10px rgba(6, 182, 212, 0.5)); transform: scale(1); }
+  50% { filter: drop-shadow(0 0 25px rgba(6, 182, 212, 0.9)); transform: scale(1.05); }
+}
+@keyframes jarvis-wave {
+  0% { height: 10%; opacity: 0.3; }
+  50% { height: 100%; opacity: 1; }
+  100% { height: 10%; opacity: 0.3; }
+}
+
+.jarvis-ring-1 { animation: jarvis-spin-slow 10s linear infinite; }
+.jarvis-ring-2 { animation: jarvis-spin-reverse-slow 15s linear infinite; }
+.jarvis-ring-3 { animation: jarvis-spin-slow 22s linear infinite; border-style: dashed; }
+.jarvis-core { animation: jarvis-pulse-glow 3s ease-in-out infinite; }
+
+.jarvis-hud-border {
+  border: 1px solid rgba(6, 182, 212, 0.3);
+  box-shadow: inset 0 0 15px rgba(6, 182, 212, 0.1), 0 0 10px rgba(6, 182, 212, 0.2);
+  position: relative;
+}
+.jarvis-hud-border::before, .jarvis-hud-border::after {
+  content: ''; position: absolute; pointer-events: none; z-index: 10; width: 12px; height: 12px;
+}
+.jarvis-hud-border::before { top: 0; left: 0; border-top: 2px solid cyan; border-left: 2px solid cyan; }
+.jarvis-hud-border::after { bottom: 0; right: 0; border-bottom: 2px solid cyan; border-right: 2px solid cyan; }
+
+.text-shadow-glow { text-shadow: 0 0 10px rgba(6, 182, 212, 0.8), 0 0 20px rgba(6, 182, 212, 0.4); }
+
 @keyframes scanline { 0% { top: 0%; } 50% { top: 100%; box-shadow: 0 -5px 15px rgba(16,185,129,0.8); } 100% { top: 0%; } }
 .fingerprint-scanner { position: relative; overflow: hidden; }
 .fingerprint-scanner::after { content: ''; position: absolute; left: 0; right: 0; top: 0; height: 2px; background: #34d399; animation: scanline 1.5s linear infinite; display: none; z-index: 10; }
@@ -64,7 +101,41 @@ input, textarea { user-select: text; -webkit-user-select: text; }
 
 .crt-scanline { background: repeating-linear-gradient(0deg, rgba(0,0,0,0.15), rgba(0,0,0,0.15) 1px, transparent 1px, transparent 2px); z-index: 5; pointer-events: none; }
 .cyber-cut { clip-path: polygon(15px 0, 100% 0, 100% calc(100% - 15px), calc(100% - 15px) 100%, 0 100%, 0 15px); border-radius: 0 !important; }
-.glass-effect { @apply bg-[#1e293b]/80 backdrop-blur-xl border-white/10; }
+.glass-effect { @apply bg-white/80 dark:bg-[#1e293b]/80 backdrop-blur-xl border-slate-200 dark:border-white/10; }
 .btn-interact { @apply active:scale-95 transition-transform; cursor: pointer; }
 .inventory-row:hover { background-color: rgba(16, 185, 129, 0.08) !important; }
 
+
+@keyframes jarvis-radar-sweep {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+.jarvis-radar-cone {
+  background: conic-gradient(from 0deg, transparent 70%, rgba(6, 182, 212, 0.6) 100%);
+  animation: jarvis-radar-sweep 3s linear infinite;
+  border-radius: 50%;
+}
+@keyframes jarvis-data-scrolling {
+  0% { transform: translateY(0); }
+  100% { transform: translateY(-50%); }
+}
+.jarvis-glitch-text {
+  text-shadow: 0 0 5px rgba(6,182,212,0.8), 0 0 2px rgba(6,182,212,0.5);
+}
+.jarvis-grid-bg {
+  background-size: 20px 20px;
+  background-image:
+    linear-gradient(to right, rgba(6, 182, 212, 0.05) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(6, 182, 212, 0.05) 1px, transparent 1px);
+}
+
+@media print {
+  @page {
+    margin: 0;
+  }
+  body {
+    background: transparent !important;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+}
