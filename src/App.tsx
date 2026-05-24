@@ -13,14 +13,41 @@ import {
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from "recharts";
 import Barcode from 'react-barcode';
 import { QRCodeSVG } from "qrcode.react";
-import { collection, doc, setDoc, deleteDoc, onSnapshot, query, orderBy, writeBatch } from "firebase/firestore";
+import { collection, doc, setDoc, deleteDoc, onSnapshot, query, orderBy, writeBatch, getDocs, where } from "firebase/firestore";
 import { db } from "./firebase";
 import { motion, AnimatePresence } from "motion/react";
 import { AuthScreen } from "./AuthScreen";
 import { initAuth, googleSignIn, logout as googleLogout, getAccessToken } from "./firebaseAuth";
 import { JarvisAssistant } from "./components/JarvisAssistant";
 import { backupToDrive, restoreFromDrive, listBackupFilesInDrive } from "./driveSystem";
+import { findOrCreateSpreadsheet, syncDataToSpreadsheet, pullDataFromSpreadsheet, sendTransactionEmail } from "./sheetsSystem";
 import type { User as FirebaseUser } from "firebase/auth";
+
+// Safe Storage Wrapper to handle iFrame and locked third-party storage environments
+const safeStorage = {
+  getItem: (key: string): string | null => {
+    try {
+      return localStorage.getItem(key);
+    } catch (e) {
+      console.warn("Storage access denied for getItem:", e);
+      return null;
+    }
+  },
+  setItem: (key: string, value: string): void => {
+    try {
+      localStorage.setItem(key, value);
+    } catch (e) {
+      console.warn("Storage access denied for setItem:", e);
+    }
+  },
+  removeItem: (key: string): void => {
+    try {
+      localStorage.removeItem(key);
+    } catch (e) {
+      console.warn("Storage access denied for removeItem:", e);
+    }
+  }
+};
 
 type Item = {
   id: string;
@@ -64,6 +91,13 @@ export default function App() {
   const [driveBackups, setDriveBackups] = useState<any[]>([]);
   const [showDriveModal, setShowDriveModal] = useState(false);
 
+  const [sheetsSpreadsheetId, setSheetsSpreadsheetId] = useState<string | null>(() => safeStorage.getItem("sheets_spreadsheet_id") || null);
+  const [isSheetsAutosyncEnabled, setIsSheetsAutosyncEnabled] = useState<boolean>(() => safeStorage.getItem("sheets_autosync") !== "false");
+  const [isSheetsSyncing, setIsSheetsSyncing] = useState(false);
+
+  const [notificationEmail, setNotificationEmail] = useState<string>(() => safeStorage.getItem("notification_email") || "");
+  const [isEmailNotificationEnabled, setIsEmailNotificationEnabled] = useState<boolean>(() => safeStorage.getItem("email_notification_enabled") === "true");
+
   useEffect(() => {
     initAuth(
       (user, token) => setGoogleUser(user),
@@ -94,6 +128,44 @@ export default function App() {
     }, timeout);
   };
   
+  // PWA (Progressive Web App) Installation Engine
+  const [deferredPrompt, setDeferredPrompt] = useState<any>(null);
+  const [appInstalled, setAppInstalled] = useState(false);
+
+  useEffect(() => {
+    const handleBeforeInstallPrompt = (e: any) => {
+      e.preventDefault();
+      setDeferredPrompt(e);
+      console.log('beforeinstallprompt event dispatched and captured.');
+    };
+    window.addEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
+
+    const handleAppInstalled = () => {
+      setAppInstalled(true);
+      setDeferredPrompt(null);
+      console.log('PWA was installed successfully!');
+    };
+    window.addEventListener('appinstalled', handleAppInstalled);
+
+    return () => {
+      window.removeEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
+      window.removeEventListener('appinstalled', handleAppInstalled);
+    };
+  }, []);
+
+  const triggerPwaInstall = async () => {
+    if (!deferredPrompt) {
+      alert("Browser Anda belum memicu persetujuan instal secara otomatis. Harap ikuti petunjuk manual di bawah.");
+      return;
+    }
+    deferredPrompt.prompt();
+    const { outcome } = await deferredPrompt.userChoice;
+    console.log(`User choice outcome to installation: ${outcome}`);
+    if (outcome === 'accepted') {
+      setDeferredPrompt(null);
+    }
+  };
+  
   // Scanner state
   const [scanInput, setScanInput] = useState("");
   const [cameraActive, setCameraActive] = useState(false);
@@ -121,17 +193,23 @@ export default function App() {
   const [closedPushNotifs, setClosedPushNotifs] = useState<string[]>([]);
   
   const [dashboardLayout, setDashboardLayout] = useState<string[]>(() => {
-    const saved = localStorage.getItem('ryo_dashboard_layout');
-    return saved ? JSON.parse(saved) : ['metrics', 'chart', 'pie', 'logs'];
+    try {
+      const saved = safeStorage.getItem('ryo_dashboard_layout');
+      if (saved && saved !== "undefined") return JSON.parse(saved);
+    } catch(e) {}
+    return ['metrics', 'chart', 'pie', 'logs'];
   });
 
   useEffect(() => {
-    localStorage.setItem('ryo_dashboard_layout', JSON.stringify(dashboardLayout));
+    safeStorage.setItem('ryo_dashboard_layout', JSON.stringify(dashboardLayout));
   }, [dashboardLayout]);
 
   const [telegramConfig, setTelegramConfig] = useState<{botToken: string, chatId: string}>(() => {
-    const stored = localStorage.getItem('ryo_telegram');
-    return stored ? JSON.parse(stored) : { botToken: '', chatId: '' };
+    try {
+      const stored = safeStorage.getItem('ryo_telegram');
+      if (stored && stored !== "undefined") return JSON.parse(stored);
+    } catch(e) {}
+    return { botToken: '', chatId: '' };
   });
 
   const [selectedItems, setSelectedItems] = useState<string[]>([]);
@@ -141,10 +219,11 @@ export default function App() {
   const [inventoryCategoryFilter, setInventoryCategoryFilter] = useState("ALL");
   const [printLayout, setPrintLayout] = useState<"auto" | "normal" | "compact">("auto");
   const [isOnline, setIsOnline] = useState(navigator.onLine);
+  const [onlyOverdueFilter, setOnlyOverdueFilter] = useState(false);
 
   useEffect(() => {
     setInventoryPage(1);
-  }, [inventorySearch, inventoryCategoryFilter, inventorySort]);
+  }, [inventorySearch, inventoryCategoryFilter, inventorySort, onlyOverdueFilter]);
   
   // Authentication State
   const [isAuthenticated, setIsAuthenticated] = useState(false);
@@ -154,12 +233,12 @@ export default function App() {
   const [viewingItem, setViewingItem] = useState<Item | null>(null);
 
   const [isLiteMode, setIsLiteMode] = useState<boolean>(() => {
-    const stored = localStorage.getItem('ryo_lite_mode');
+    const stored = safeStorage.getItem('ryo_lite_mode');
     return stored === 'true';
   });
 
   useEffect(() => {
-    localStorage.setItem('ryo_lite_mode', String(isLiteMode));
+    safeStorage.setItem('ryo_lite_mode', String(isLiteMode));
   }, [isLiteMode]);
   
   useEffect(() => {
@@ -172,23 +251,23 @@ export default function App() {
       window.removeEventListener('offline', handleOffline);
     };
   }, []);
+
+  const filteredInventory = React.useMemo(() => {
+    return inventory
+      .filter(item => {
+        const searchLower = (inventorySearch || "").toLowerCase();
+        return (item.name || "").toLowerCase().includes(searchLower) || 
+               (item.id || "").toLowerCase().includes(searchLower) || 
+               (item.serial || "").toLowerCase().includes(searchLower);
+      })
+      .filter(item => inventoryCategoryFilter === "ALL" || item.category === inventoryCategoryFilter)
+      .filter(item => !onlyOverdueFilter || (item.status === 'Keluar' && item.dueDate && Date.now() > item.dueDate));
+  }, [inventory, inventorySearch, inventoryCategoryFilter, onlyOverdueFilter]);
   
-  // Notification System Support
-  const [notificationPermission, setNotificationPermission] = useState<NotificationPermission>('default');
-
-  useEffect(() => {
-    if ('Notification' in window) {
-      setNotificationPermission(Notification.permission);
-      if (Notification.permission === 'default') {
-        Notification.requestPermission().then(setNotificationPermission);
-      }
-    }
-  }, []);
-
-  const sendPushNotification = (title: string, options?: NotificationOptions) => {
-    if ('Notification' in window && Notification.permission === 'granted') {
-      new Notification(title, options);
-    }
+  // Notification System Support (Fallback to In-App HUD and Telegram only, completely disabling browser popups)
+  const sendPushNotification = (title: string, options?: any) => {
+    // Completely disable native browser push notifications to avoid Chrome permission popups
+    console.info("[In-App Notification]", title, options?.body || "");
   };
 
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -196,24 +275,17 @@ export default function App() {
   const notifiedOverdueRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
-    if ("Notification" in window && Notification.permission === "default") {
-      Notification.requestPermission();
-    }
-  }, []);
-
-  useEffect(() => {
-    if (!("Notification" in window) || Notification.permission !== "granted") return;
-
     const overdueItems = inventory.filter(i => i.status === 'Keluar' && i.dueDate && Date.now() > i.dueDate);
     
     overdueItems.forEach(item => {
       if (!notifiedOverdueRef.current.has(item.id)) {
-        new Notification("PERINGATAN GUDANG - OVERDUE", {
+        sendPushNotification("PERINGATAN GUDANG - OVERDUE", {
           body: `ASET: ${item.name} [${item.id}]\nBelum dikembalikan oleh: ${item.holder}`,
         });
         
-        const tConfigStr = localStorage.getItem('ryo_telegram');
-        const tConfig = tConfigStr ? JSON.parse(tConfigStr) : { botToken: "", chatId: "" };
+        const tConfigStr = safeStorage.getItem('ryo_telegram');
+        let tConfig = { botToken: "", chatId: "" };
+        try { if (tConfigStr && tConfigStr !== "undefined") tConfig = JSON.parse(tConfigStr); } catch(e){}
 
         // Also send Telegram Notification
         fetch('/api/telegram/send', {
@@ -261,7 +333,7 @@ export default function App() {
       stats[uname] = { total: 0, scansOut: 0, scansIn: 0, adds: 0 };
     });
     logs.forEach(log => {
-      const op = (log.operator || "SYSTEM").toUpperCase();
+      const op = (log.operator || "SYSTEM").toString().toUpperCase();
       if (!stats[op]) {
         stats[op] = { total: 0, scansOut: 0, scansIn: 0, adds: 0 };
       }
@@ -341,6 +413,39 @@ export default function App() {
   const previousItemsRefForNotification = useRef<Map<string, Item>>(new Map());
 
   useEffect(() => {
+    // Auto-clean history logs older than 3 months (90 days) on startup
+    const cleanOldDbLogs = async () => {
+      try {
+        const THREE_MONTHS_MS = 90 * 24 * 60 * 60 * 1000;
+        const cutoff = Date.now() - THREE_MONTHS_MS;
+        const qOldLogs = query(collection(db, "logs"), where("timestamp", "<", cutoff));
+        const snapshot = await getDocs(qOldLogs);
+        
+        if (!snapshot.empty) {
+          console.info(`[Log Purge] Found ${snapshot.size} logs older than 3 months. Preparing automated cleanup...`);
+          // Batch deletes capped at 400 for safety against Firestore batch limit (500)
+          const batch = writeBatch(db);
+          const slicedDocs = snapshot.docs.slice(0, 400);
+          slicedDocs.forEach(d => batch.delete(d.ref));
+          await batch.commit();
+          console.info(`[Log Purge] Cleaned up ${slicedDocs.length} historical logs successfully.`);
+        } else {
+          console.info("[Log Purge] No logs older than 3 months found. System database optimal.");
+        }
+      } catch (error) {
+        console.error("Historical log cleanup error:", error);
+      }
+    };
+
+    // Run 3 seconds after startup to prioritize quick initial rendering
+    const delayTimer = setTimeout(() => {
+      cleanOldDbLogs();
+    }, 3000);
+
+    return () => clearTimeout(delayTimer);
+  }, []);
+
+  useEffect(() => {
     // Realtime Sync with Firestore
     const unsubscribeItems = onSnapshot(collection(db, "items"), (snapshot) => {
       const itemsData = snapshot.docs.map(doc => doc.data() as Item);
@@ -349,11 +454,11 @@ export default function App() {
       itemsData.forEach(item => newMap.set(item.id, item));
 
       // Check for critical changes
-      if (previousItemsRefForNotification.current.size > 0 && 'Notification' in window && Notification.permission === 'granted') {
+      if (previousItemsRefForNotification.current.size > 0) {
           itemsData.forEach(newItem => {
              const oldItem = previousItemsRefForNotification.current.get(newItem.id);
              if (oldItem && oldItem.status !== newItem.status && newItem.status === "Keluar") {
-                new Notification('Peringatan: Status Aset Kritis', { body: `Aset ${newItem.name} (SKU: ${newItem.id}) telah dikeluarkan oleh ${newItem.holder || 'Seseorang'}.` });
+                sendPushNotification('Peringatan: Status Aset Kritis', { body: `Aset ${newItem.name} (SKU: ${newItem.id}) telah dikeluarkan oleh ${newItem.holder || 'Seseorang'}.` });
              }
           });
       }
@@ -375,9 +480,15 @@ export default function App() {
     });
 
     const unsubscribeUsers = onSnapshot(collection(db, "users"), (snapshot) => {
-      const usersData = snapshot.docs.map(doc => doc.data() as any);
+      const usersData = snapshot.docs.map(doc => {
+        const data = doc.data() as any;
+        return {
+          ...data,
+          username: data.username || doc.id
+        };
+      });
       // Ensure RYO KUN exists in usersData
-      if (!usersData.some((u: any) => u.username === 'RYO KUN')) {
+      if (!usersData.some((u: any) => (u.username || "").toString().toUpperCase() === 'RYO KUN')) {
           usersData.push({ username: 'RYO KUN', role: 'superadmin', password: '123' });
       }
       setUsers(usersData);
@@ -471,6 +582,72 @@ export default function App() {
         batch.set(doc(db, "items", item.id), updatedItem);
         batch.set(doc(collection(db, "logs")), newLog);
         await batch.commit();
+
+        // Send Email Notification if configured
+        if (isEmailNotificationEnabled && notificationEmail && googleUser) {
+          const typeLabel = isOut ? "KELUAR (CHECK-OUT)" : "KEMBALI (CHECK-IN)";
+          const subject = `[MUTASI GUDANG ASET] ${updatedItem.name} - ${typeLabel}`;
+          const body = `
+            <div style="font-family: Arial, sans-serif; max-width: 600px; border: 1px solid #e2e8f0; border-radius: 12px; padding: 24px; color: #0f172a; background-color: #ffffff;">
+              <h2 style="color: ${isOut ? "#dc2626" : "#16a34a"}; margin-top: 0; padding-bottom: 12px; border-bottom: 1px solid #e2e8f0; font-size: 18px; font-weight: 800; text-transform: uppercase;">Notifikasi Mutasi Aset Gudang</h2>
+              <p style="font-size: 13px; line-height: 1.6; color: #475569;">Sistem mencatat perubahan status mutasi barang inventaris dengan rincian operasional di bawah ini:</p>
+              
+              <table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
+                <tr style="background-color: #f8fafc;">
+                  <th style="text-align: left; padding: 10px; border: 1px solid #e2e8f0; font-size: 12px; font-weight: 900; text-transform: uppercase; color: #475569;">Parameter</th>
+                  <th style="text-align: left; padding: 10px; border: 1px solid #e2e8f0; font-size: 12px; font-weight: 900; text-transform: uppercase; color: #475569;">Detail Terdaftar</th>
+                </tr>
+                <tr>
+                  <td style="padding: 10px; border: 1px solid #e2e8f0; font-size: 12px; font-weight: bold; color: #1e293b; width: 180px;">Nama Aset</td>
+                  <td style="padding: 10px; border: 1px solid #e2e8f0; font-size: 12px; color: #0f172a; font-weight: 600;">${updatedItem.name}</td>
+                </tr>
+                <tr>
+                  <td style="padding: 10px; border: 1px solid #e2e8f0; font-size: 12px; font-weight: bold; color: #1e293b;">SKU / ID Barcode</td>
+                  <td style="padding: 10px; border: 1px solid #e2e8f0; font-size: 12px; color: #ef4444; font-name: monospace; font-weight: 700;">${updatedItem.id}</td>
+                </tr>
+                <tr>
+                  <td style="padding: 10px; border: 1px solid #e2e8f0; font-size: 12px; font-weight: bold; color: #1e293b;">Kategori</td>
+                  <td style="padding: 10px; border: 1px solid #e2e8f0; font-size: 12px; color: #475569;">${updatedItem.category}</td>
+                </tr>
+                <tr>
+                  <td style="padding: 10px; border: 1px solid #e2e8f0; font-size: 12px; font-weight: bold; color: #1e293b;">Nomor Seri</td>
+                  <td style="padding: 10px; border: 1px solid #e2e8f0; font-size: 12px; color: #475569;">${updatedItem.serial || '-'}</td>
+                </tr>
+                <tr>
+                  <td style="padding: 10px; border: 1px solid #e2e8f0; font-size: 12px; font-weight: bold; color: #1e293b;">Nomor Popor / Rak</td>
+                  <td style="padding: 10px; border: 1px solid #e2e8f0; font-size: 12px; color: #475569;">${updatedItem.popor || '-'}</td>
+                </tr>
+                <tr>
+                  <td style="padding: 10px; border: 1px solid #e2e8f0; font-size: 12px; font-weight: bold; color: #1e293b;">Aksi Transaksi</td>
+                  <td style="padding: 10px; border: 1px solid #e2e8f0; font-size: 12px; font-weight: 800; color: ${isOut ? "#dc2626" : "#16a34a"};">${typeLabel}</td>
+                </tr>
+                <tr>
+                  <td style="padding: 10px; border: 1px solid #e2e8f0; font-size: 12px; font-weight: bold; color: #1e293b;">Peminjam / Pemegang</td>
+                  <td style="padding: 10px; border: 1px solid #e2e8f0; font-size: 12px; color: #020617; font-weight: bold;">${newHolder}</td>
+                </tr>
+                <tr>
+                  <td style="padding: 10px; border: 1px solid #e2e8f0; font-size: 12px; font-weight: bold; color: #1e293b;">Batas Pengembalian</td>
+                  <td style="padding: 10px; border: 1px solid #e2e8f0; font-size: 12px; color: #b91c1c; font-weight: bold;">${updatedItem.dueDate ? new Date(updatedItem.dueDate).toLocaleString('id-ID') : '-'}</td>
+                </tr>
+                <tr>
+                  <td style="padding: 10px; border: 1px solid #e2e8f0; font-size: 12px; font-weight: bold; color: #1e293b;">Operator Pelapor</td>
+                  <td style="padding: 10px; border: 1px solid #e2e8f0; font-size: 12px; color: #475569;">${currentUser?.username || "SYSTEM"}</td>
+                </tr>
+                <tr>
+                  <td style="padding: 10px; border: 1px solid #e2e8f0; font-size: 12px; font-weight: bold; color: #1e293b;">Timestamp Laporan</td>
+                  <td style="padding: 10px; border: 1px solid #e2e8f0; font-size: 12px; color: #475569;">${newLog.fullDate} ${newLog.time}</td>
+                </tr>
+              </table>
+
+              <div style="margin-top: 30px; padding-top: 15px; border-top: 1px solid #e2e8f0; font-size: 11px; color: #94a3b8; text-align: center; font-family: monospace;">
+                Pemberitahuan Otomatis Gudang Senjata & Inventaris • Terproteksi Secure API
+              </div>
+            </div>
+          `;
+          sendTransactionEmail(notificationEmail, subject, body).catch(e => {
+            console.error("Gagal mengirim email mutasi:", e);
+          });
+        }
         
         speakAnnouncement({ ...item, holder: isOut ? newHolder : item.holder }, isOut);
         
@@ -906,6 +1083,90 @@ export default function App() {
       }
   };
 
+  const handleConnectToSheets = async () => {
+    setIsSheetsSyncing(true);
+    try {
+      const sheetId = await findOrCreateSpreadsheet();
+      setSheetsSpreadsheetId(sheetId);
+      safeStorage.setItem("sheets_spreadsheet_id", sheetId);
+      
+      // Perform an initial sync
+      await syncDataToSpreadsheet(sheetId, inventory, logs);
+      alert("Koneksi Google Sheets Berhasil! File 'Database Inventaris Gudang' telah terhubung dan disinkronkan.");
+    } catch (err: any) {
+      console.error(err);
+      alert("Gagal menghubungkan Google Sheets: " + (err.message || err));
+    } finally {
+      setIsSheetsSyncing(false);
+    }
+  };
+
+  const handleSyncToSheets = async () => {
+    if (!sheetsSpreadsheetId) return;
+    setIsSheetsSyncing(true);
+    try {
+      await syncDataToSpreadsheet(sheetsSpreadsheetId, inventory, logs);
+      alert("Sinkronisasi Google Sheets Berhasil!");
+    } catch (err: any) {
+      console.error(err);
+      alert("Gagal sinkronisasi Google Sheets: " + (err.message || err));
+    } finally {
+      setIsSheetsSyncing(false);
+    }
+  };
+
+  const handleToggleSheetsAutosync = (enabled: boolean) => {
+    setIsSheetsAutosyncEnabled(enabled);
+    safeStorage.setItem("sheets_autosync", enabled ? "true" : "false");
+  };
+
+  const handlePullFromSheets = async () => {
+    if (!sheetsSpreadsheetId) return;
+    setIsSheetsSyncing(true);
+    try {
+      const gsheetItems = await pullDataFromSpreadsheet(sheetsSpreadsheetId);
+      if (gsheetItems.length === 0) {
+        alert("Tidak ada item ditemukan di Google Sheets untuk ditarik.");
+        return;
+      }
+
+      const confirmPull = confirm(
+        `Berhasil memuat ${gsheetItems.length} aset dari Google Sheets.\nApakah Anda yakin ingin melakukan sinkronisasi dua arah? Data akan diperbarui di Firebase dan Web sesuai isi spreadsheet.`
+      );
+      if (!confirmPull) return;
+
+      const batch = writeBatch(db);
+      // We overwrite existing or add new ones pulled from google sheet values
+      for (const item of gsheetItems) {
+        batch.set(doc(db, "items", item.id), item);
+      }
+
+      await batch.commit();
+      alert("Sinkronisasi dua arah berhasil! Database lokal dan Firebase telah diperbarui sesuai isi Google Sheets.");
+    } catch (err: any) {
+      console.error(err);
+      alert("Gagal sinkronisasi dari Google Sheets: " + (err.message || err));
+    } finally {
+      setIsSheetsSyncing(false);
+    }
+  };
+
+  // Autosync effect
+  useEffect(() => {
+    if (!googleUser || !sheetsSpreadsheetId || !isSheetsAutosyncEnabled || inventory.length === 0) return;
+
+    const timer = setTimeout(async () => {
+      try {
+        console.log("Auto-syncing newest state to Google Sheets...");
+        await syncDataToSpreadsheet(sheetsSpreadsheetId, inventory, logs);
+      } catch (err) {
+        console.error("Autosync Sheets Gagal:", err);
+      }
+    }, 4000); // 4 seconds debouncing
+
+    return () => clearTimeout(timer);
+  }, [inventory, logs, sheetsSpreadsheetId, googleUser, isSheetsAutosyncEnabled]);
+
   const handleBackupToDrive = async () => {
       if (!confirm("Apakah Anda yakin ingin melakukan sinkronisasi pencadangan ke Google Drive Anda?")) return;
       setIsDriveSyncing(true);
@@ -1015,14 +1276,14 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
   const [appTheme, setAppTheme] = useState<'dark' | 'light'>('dark');
 
   useEffect(() => {
-    const savedTheme = localStorage.getItem('ryo_theme') as 'dark' | 'light';
+    const savedTheme = safeStorage.getItem('ryo_theme') as 'dark' | 'light';
     if (savedTheme) {
       setAppTheme(savedTheme);
     }
   }, []);
 
   useEffect(() => {
-    localStorage.setItem('ryo_theme', appTheme);
+    safeStorage.setItem('ryo_theme', appTheme);
     if (appTheme === 'dark') {
       document.documentElement.classList.add('dark');
     } else {
@@ -1033,7 +1294,7 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
   const toggleTheme = () => {
     const newTheme = appTheme === 'dark' ? 'light' : 'dark';
     setAppTheme(newTheme);
-    localStorage.setItem('ryo_theme', newTheme);
+    safeStorage.setItem('ryo_theme', newTheme);
   };
 
   if (!isAuthenticated || !currentUser) {
@@ -1884,7 +2145,7 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                       <button 
                          onClick={() => {
                             const displayedIds = inventory
-                               .filter(item => item.name.toLowerCase().includes(inventorySearch.toLowerCase()) || item.id.toLowerCase().includes(inventorySearch.toLowerCase()) || item.serial.toLowerCase().includes(inventorySearch.toLowerCase()))
+                               .filter(item => (item.name || "").toLowerCase().includes((inventorySearch || "").toLowerCase()) || (item.id || "").toLowerCase().includes((inventorySearch || "").toLowerCase()) || (item.serial || "").toLowerCase().includes((inventorySearch || "").toLowerCase()))
                                .filter(item => inventoryCategoryFilter === "ALL" || item.category === inventoryCategoryFilter)
                                .map(i => i.id);
                             
@@ -1896,18 +2157,18 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                                setSelectedItems([...selectedItems, ...newIds]);
                             }
                          }}
-                         className="bg-emerald-900/20 p-3 rounded-xl border border-emerald-900/50 flex-shrink-0 hover:bg-emerald-900/40 transition-colors"
+                         className="bg-emerald-950/20 p-3 rounded-xl border border-emerald-900/50 flex-shrink-0 hover:bg-emerald-950/40 transition-colors"
                       >
                          <div className={`w-5 h-5 border-2 rounded flex items-center justify-center ${(() => {
                              const displayedIds = inventory
-                               .filter(item => item.name.toLowerCase().includes(inventorySearch.toLowerCase()) || item.id.toLowerCase().includes(inventorySearch.toLowerCase()) || item.serial.toLowerCase().includes(inventorySearch.toLowerCase()))
+                               .filter(item => (item.name || "").toLowerCase().includes((inventorySearch || "").toLowerCase()) || (item.id || "").toLowerCase().includes((inventorySearch || "").toLowerCase()) || (item.serial || "").toLowerCase().includes((inventorySearch || "").toLowerCase()))
                                .filter(item => inventoryCategoryFilter === "ALL" || item.category === inventoryCategoryFilter)
                                .map(i => i.id);
                              return displayedIds.length > 0 && displayedIds.every(id => selectedItems.includes(id));
                          })() ? 'border-emerald-500 bg-emerald-500' : 'border-emerald-500/50'}`}>
                              {(() => {
                                  const displayedIds = inventory
-                                   .filter(item => item.name.toLowerCase().includes(inventorySearch.toLowerCase()) || item.id.toLowerCase().includes(inventorySearch.toLowerCase()) || item.serial.toLowerCase().includes(inventorySearch.toLowerCase()))
+                                   .filter(item => (item.name || "").toLowerCase().includes((inventorySearch || "").toLowerCase()) || (item.id || "").toLowerCase().includes((inventorySearch || "").toLowerCase()) || (item.serial || "").toLowerCase().includes((inventorySearch || "").toLowerCase()))
                                    .filter(item => inventoryCategoryFilter === "ALL" || item.category === inventoryCategoryFilter)
                                    .map(i => i.id);
                                  return displayedIds.length > 0 && displayedIds.every(id => selectedItems.includes(id));
@@ -1924,6 +2185,20 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                           />
                           <Search size={16} className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-600 dark:text-slate-400" />
                       </div>
+                      {/* Overdue Quick Filter Button */}
+                      <button
+                        type="button"
+                        onClick={() => setOnlyOverdueFilter(!onlyOverdueFilter)}
+                        className={`shadow-[0_2px_10px_rgba(0,0,0,0.02)] px-4 py-3 rounded-xl text-xs font-black uppercase tracking-widest outline-none flex items-center justify-center gap-2 border w-full md:w-auto transition-all cursor-pointer ${
+                          onlyOverdueFilter
+                            ? "bg-rose-600 text-white border-rose-600 dark:bg-rose-500 hover:bg-rose-500 dark:hover:bg-rose-450 shadow-[0_0_12px_rgba(244,63,94,0.4)]"
+                            : "bg-slate-50 dark:bg-[#020617]/50 text-slate-600 dark:text-slate-400 border-slate-200 dark:border-slate-800 hover:border-slate-300 dark:hover:bg-slate-700"
+                        }`}
+                      >
+                        <AlertTriangle size={14} className={onlyOverdueFilter ? "animate-pulse" : ""} />
+                        <span>OVERDUE ({inventory.filter(i => i.status === 'Keluar' && i.dueDate && Date.now() > i.dueDate).length})</span>
+                      </button>
+
                       <select 
                         value={inventoryCategoryFilter}
                         onChange={(e) => setInventoryCategoryFilter(e.target.value)}
@@ -1992,9 +2267,7 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                               </tr>
                           </thead>
                           <tbody className="divide-y divide-slate-800/50">
-                              {inventory
-                                .filter(item => item.name.toLowerCase().includes(inventorySearch.toLowerCase()) || item.id.toLowerCase().includes(inventorySearch.toLowerCase()) || item.serial.toLowerCase().includes(inventorySearch.toLowerCase()))
-                                .filter(item => inventoryCategoryFilter === "ALL" || item.category === inventoryCategoryFilter)
+                              {filteredInventory
                                 .sort((a, b) => inventorySort === 'newest' ? new Date(b.date).getTime() - new Date(a.date).getTime() : new Date(a.date).getTime() - new Date(b.date).getTime())
                                 .slice((inventoryPage - 1) * 10, inventoryPage * 10)
                                 .map((item, i) => {
@@ -2089,12 +2362,12 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                                   </tr>
                                   );
                               })}
-                              {inventory.length === 0 && <tr><td colSpan={10} className="p-10 text-center text-slate-600 dark:text-slate-400 font-bold uppercase text-xs">Inventaris Kosong.</td></tr>}
+                              {filteredInventory.length === 0 && <tr><td colSpan={11} className="p-10 text-center text-slate-600 dark:text-slate-400 font-bold uppercase text-xs">Aset tidak ditemukan atau filter tidak mencocokkan apa pun.</td></tr>}
                           </tbody>
                       </table>
                   </div>
                   {(() => {
-                      const totalAssets = inventory.filter(item => item.name.toLowerCase().includes(inventorySearch.toLowerCase()) || item.id.toLowerCase().includes(inventorySearch.toLowerCase()) || item.serial.toLowerCase().includes(inventorySearch.toLowerCase())).filter(item => inventoryCategoryFilter === "ALL" || item.category === inventoryCategoryFilter).length;
+                      const totalAssets = filteredInventory.length;
                       const totalPages = Math.ceil(totalAssets / 10);
                       
                       if (totalPages <= 1) return null;
@@ -2719,7 +2992,7 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                       <button
                         onClick={async () => {
                           if (!telegramConfig.botToken || !telegramConfig.chatId) return alert("Harap isi Token Bot dan Chat ID.");
-                          localStorage.setItem('ryo_telegram', JSON.stringify(telegramConfig));
+                          safeStorage.setItem('ryo_telegram', JSON.stringify(telegramConfig));
                           try {
                             const res = await fetch('/api/telegram/send', {
                               method: 'POST',
@@ -2742,6 +3015,83 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                         SIMPAN & UJI COBA
                       </button>
                       <p className="text-[10px] text-slate-600 dark:text-slate-400 text-center uppercase font-bold mt-2 tracking-widest">Bot akan memberi tahu jika ada aset yang <span className="text-red-500">overdue</span></p>
+                   </div>
+
+                   <hr className="border-slate-200 dark:border-slate-800/50 my-8" />
+
+                   <div className="space-y-4">
+                      <div className="flex items-center gap-2 mb-2">
+                        <Phone size={16} className="text-emerald-500" />
+                        <p className="text-[10px] font-black text-slate-600 dark:text-slate-400 uppercase tracking-widest">Instalasi Aplikasi Handphone (PWA)</p>
+                      </div>
+                      
+                      <div className="bg-slate-50 dark:bg-[#020617] p-6 rounded-[24px] border border-slate-200 dark:border-slate-800">
+                         {(() => {
+                           const isStandalone = window.matchMedia('(display-mode: standalone)').matches || (window.navigator as any).standalone;
+                           if (isStandalone) {
+                             return (
+                               <div className="text-center py-4">
+                                 <div className="inline-flex p-3 bg-emerald-500/10 text-emerald-500 rounded-full mb-3">
+                                   <ShieldCheck size={24} />
+                                 </div>
+                                 <h4 className="text-sm font-black text-slate-950 dark:text-white uppercase">Aplikasi Sudah Terpasang</h4>
+                                 <p className="text-[10px] text-slate-500 dark:text-slate-400 mt-1 uppercase font-bold tracking-wider">Anda sedang menggunakan versi aplikasi mandiri gudang senjata (PWA) di perangkat handphone.</p>
+                               </div>
+                             );
+                           }
+
+                           return (
+                             <div className="space-y-6">
+                               <div className="flex flex-col md:flex-row items-center justify-between gap-4 pb-4 border-b border-slate-100 dark:border-slate-800/50">
+                                  <div className="text-center md:text-left">
+                                     <h4 className="text-xs font-black text-slate-900 dark:text-slate-100 uppercase tracking-wider">Instal ke Layar Utama HP</h4>
+                                     <p className="text-[10px] text-slate-500 dark:text-slate-400 mt-1 cursor-default">Gunakan aplikasi dengan lebih cepat, lancar, dan mendukung notifikasi realtime di HP anda.</p>
+                                  </div>
+                                  {deferredPrompt ? (
+                                    <button 
+                                      onClick={triggerPwaInstall}
+                                      className="btn-interact bg-emerald-600 hover:bg-emerald-500 text-slate-900 dark:text-white px-5 py-3 rounded-xl font-black text-[10px] uppercase tracking-widest flex items-center gap-2 transition-all shrink-0 shadow-lg shadow-emerald-900/10 cursor-pointer"
+                                    >
+                                       <Download size={14} /> INSTAL SEKARANG
+                                    </button>
+                                  ) : (
+                                    <div className="bg-slate-100 dark:bg-slate-900 px-4 py-2.5 rounded-xl border border-slate-200 dark:border-slate-800 shrink-0 select-none">
+                                       <span className="text-[9px] font-black text-slate-500 uppercase tracking-widest">SIAP DIINSTAL MANUAL</span>
+                                    </div>
+                                  )}
+                               </div>
+
+                               <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                                  <div className="space-y-2">
+                                     <div className="flex items-center gap-2">
+                                        <div className="w-1.5 h-1.5 rounded-full bg-emerald-500"></div>
+                                        <span className="text-[9px] font-black text-slate-700 dark:text-slate-300 uppercase tracking-wider text-left">Petunjuk Android (Google Chrome)</span>
+                                     </div>
+                                     <ol className="text-[10px] font-bold text-slate-500 dark:text-slate-400 list-decimal pl-4 space-y-1 normal-case leading-relaxed text-left">
+                                        <li>Buka link share / website publish di aplikasi <strong className="text-slate-900 dark:text-slate-200">Google Chrome</strong> HP Anda.</li>
+                                        <li>Klik tombol <strong className="text-slate-900 dark:text-slate-200">Instal Sekarang</strong> di atas, ATAU tap <strong className="text-slate-900 dark:text-slate-200">titik tiga (menu)</strong> di pojok kanan atas Chrome.</li>
+                                        <li>Pilih menu <strong className="text-emerald-500">"Tambahkan ke Layar Utama"</strong> atau <strong className="text-emerald-500">"Instal Aplikasi"</strong>.</li>
+                                        <li>Aplikasi siap diakses langsung dari beranda HP anda tanpa browser!</li>
+                                     </ol>
+                                  </div>
+
+                                  <div className="space-y-2 border-t md:border-t-0 md:border-l border-slate-200 dark:border-slate-800/60 pt-4 md:pt-0 md:pl-6">
+                                     <div className="flex items-center gap-2">
+                                        <div className="w-1.5 h-1.5 rounded-full bg-orange-400"></div>
+                                        <span className="text-[9px] font-black text-slate-700 dark:text-slate-300 uppercase tracking-wider text-left">Petunjuk iPhone / iOS (Safari)</span>
+                                     </div>
+                                     <ol className="text-[10px] font-bold text-slate-500 dark:text-slate-400 list-decimal pl-4 space-y-1 normal-case leading-relaxed text-left">
+                                        <li>Pastikan Anda sedang membuka website publish ini melalui browser <strong className="text-slate-900 dark:text-slate-200">Safari</strong> bawaan iOS.</li>
+                                        <li>Tap tombol <strong className="text-slate-900 dark:text-slate-200">"Bagikan / Share"</strong> (ikon kotak dengan panah ke atas) di deretan menu Safari.</li>
+                                        <li>Scroll ke bawah dan tap pada menu <strong className="text-emerald-500">"Tambahkan ke Layar Utama" (Add to Home Screen)</strong>.</li>
+                                        <li>Selesai! Aplikasi akan muncul di halaman utama iPhone Anda bagaikan aplikasi App Store.</li>
+                                     </ol>
+                                  </div>
+                                </div>
+                             </div>
+                           );
+                         })()}
+                      </div>
                    </div>
                </div>
           </div>
@@ -2822,31 +3172,105 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
 
                     {/* Add Item Log History */}
                     <div className="mt-8 pt-6 border-t border-slate-200 dark:border-slate-800">
-                        <h3 className="text-[10px] font-black uppercase tracking-widest text-slate-600 dark:text-slate-400 mb-4 flex items-center gap-2">
-                           <History size={12} className="text-blue-500" /> RIWAYAT LOG MUTASI ASET INI
+                        <h3 className="text-[10px] font-black uppercase tracking-widest text-slate-600 dark:text-slate-400 mb-6 flex items-center gap-2">
+                           <History size={14} className="text-blue-500" /> TIMELINE TRACK & TRACE ASET (MUTASI)
                         </h3>
-                        <div className="space-y-3">
-                           {logs.filter(l => l.id === viewingItem.id).length === 0 ? (
-                               <p className="text-xs text-slate-500 italic">Belum ada riwayat mutasi untuk aset ini.</p>
-                           ) : (
-                               logs.filter(l => l.id === viewingItem.id).sort((a,b) => b.timestamp - a.timestamp).map(log => (
-                                   <div key={log.timestamp} className="bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 rounded-xl p-3 flex gap-3 items-center">
-                                       <div className={`p-2 rounded-lg shrink-0 ${log.type === 'IN' ? 'bg-emerald-100 text-emerald-600 dark:bg-emerald-900/30' : log.type==='OUT'? 'bg-orange-100 text-orange-600 dark:bg-orange-900/30' : log.type === 'EDIT' ? 'bg-yellow-100 text-yellow-600 dark:bg-yellow-900/30' : 'bg-blue-100 text-blue-600 dark:bg-blue-900/30'}`}>
-                                            {log.type === 'IN' ? <ArrowDownRight size={14} /> : log.type === 'OUT' ? <ArrowUpRight size={14} /> : log.type === 'EDIT' ? <RefreshCw size={14} /> : <PlusSquare size={14} />}
+                        
+                        {(() => {
+                           const itemLogs = logs
+                             .filter(l => l.id === viewingItem.id)
+                             .sort((a, b) => a.timestamp - b.timestamp); // Chronological track & trace path
+                             
+                           if (itemLogs.length === 0) {
+                             return <p className="text-xs text-slate-500 italic px-4">Belum ada riwayat mutasi untuk aset ini di dalam sistem.</p>;
+                           }
+
+                           return (
+                             <div className="relative pl-6 border-l border-slate-200 dark:border-blue-900/40 ml-4 space-y-6">
+                               {itemLogs.map((log, index) => {
+                                 const isLast = index === itemLogs.length - 1;
+                                 const isFirst = index === 0;
+                                 
+                                 let indicatorColor = "bg-blue-500 border-blue-200 dark:border-blue-950";
+                                 let typeLabel = "REGISTRASI";
+                                 let badgeClassName = "bg-blue-50 text-blue-600 dark:bg-blue-950/40 dark:text-blue-400 border border-blue-200/50 dark:border-blue-900/30";
+                                 let details = `Aset pertama kali didaftarkan dengan status awal '${log.status}' oleh operator.`;
+
+                                 if (log.type === 'IN') {
+                                   indicatorColor = "bg-emerald-500 border-emerald-200 dark:border-emerald-950 text-white";
+                                   typeLabel = "CHECK-IN (KEMBALI)";
+                                   badgeClassName = "bg-emerald-50 text-emerald-600 dark:bg-emerald-950/40 dark:text-emerald-400 border border-emerald-200/50 dark:border-emerald-900/30";
+                                   details = `Dikembalikan ke gudang oleh ${log.holder || 'Seseorang'}. Status berubah menjadi Di Gudang.`;
+                                 } else if (log.type === 'OUT') {
+                                   indicatorColor = "bg-orange-500 border-orange-200 dark:border-orange-950 text-white";
+                                   typeLabel = "CHECK-OUT (KELUAR)";
+                                   badgeClassName = "bg-orange-50 text-orange-600 dark:bg-orange-950/40 dark:text-orange-400 border border-orange-200/50 dark:border-orange-900/30";
+                                   details = `Dikeluarkan / Dipinjam oleh pemegang: ${log.holder || 'Seseorang'}.`;
+                                 } else if (log.type === 'EDIT') {
+                                   indicatorColor = "bg-amber-500 border-amber-200 dark:border-amber-950 text-white";
+                                   typeLabel = "METADATA UPDATE";
+                                   badgeClassName = "bg-amber-50 text-amber-600 dark:bg-amber-950/40 dark:text-amber-400 border border-amber-200/50 dark:border-amber-900/30";
+                                   details = `Perubahan informasi data teknis atau spesifikasi aset oleh operator.`;
+                                 } else if (log.type === 'DELETE') {
+                                   indicatorColor = "bg-rose-500 border-rose-200 dark:border-rose-950 text-white";
+                                   typeLabel = "SISTEM PURGE";
+                                   badgeClassName = "bg-rose-50 text-rose-600 dark:bg-rose-950/40 dark:text-rose-400 border border-rose-200/50 dark:border-rose-950/30";
+                                   details = `Aset dihapus dari inventaris utama.`;
+                                 }
+
+                                 return (
+                                   <div key={log.timestamp} className="relative group">
+                                     <div className={`absolute -left-[31px] top-1.5 w-4 h-4 rounded-full border-2 ${indicatorColor} flex items-center justify-center shadow-md transition-transform group-hover:scale-125 z-10`} />
+                                     
+                                     <div className={`rounded-2xl p-4 transition-all duration-300 ${
+                                       isLast 
+                                         ? "bg-blue-50/50 dark:bg-blue-950/20 border border-blue-500/30 shadow-[0_0_15px_rgba(59,130,246,0.1)]" 
+                                         : "bg-white dark:bg-[#020617]/40 border border-slate-200 dark:border-slate-800/80 hover:border-slate-300 dark:hover:border-slate-700"
+                                     }`}>
+                                       <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
+                                         <div className="flex items-center gap-2">
+                                           <span className={`text-[9px] font-black tracking-widest px-2 py-0.5 rounded font-mono ${badgeClassName}`}>
+                                             {typeLabel}
+                                           </span>
+                                           {isLast && (
+                                             <span className="text-[8px] font-extrabold bg-blue-500 text-white px-1.5 py-0.5 rounded animate-pulse font-mono tracking-wider">
+                                               TERBARU (AKTIF)
+                                             </span>
+                                           )}
+                                           {isFirst && (
+                                             <span className="text-[8px] font-extrabold bg-slate-200 dark:bg-slate-800 text-slate-600 dark:text-slate-400 px-1.5 py-0.5 rounded font-mono tracking-wider">
+                                               REGISTRASI AWAL
+                                             </span>
+                                           )}
+                                         </div>
+                                         <div className="text-[10px] font-mono text-slate-500 flex items-center gap-1.5">
+                                           <Clock size={10} className="text-slate-400" />
+                                           <span>{log.fullDate} - {log.time}</span>
+                                         </div>
                                        </div>
-                                       <div className="flex-1 min-w-0">
-                                            <p className="text-[10px] font-mono text-slate-500 flex justify-between">
-                                                <span>{log.fullDate} {log.time}</span>
-                                                <span className="text-[8px] font-black tracking-wider ml-2 bg-slate-100 dark:bg-slate-800 px-1.5 py-0.5 rounded">{log.operator}</span>
-                                            </p>
-                                            <p className="text-xs font-bold text-slate-800 dark:text-slate-200 mt-0.5 truncate">
-                                                {log.type === 'OUT' ? `Dipinjam oleh: ${log.holder}` : log.type === 'IN' ? `Dikembalikan (sebelumnya: ${log.holder || '-'})` : log.type === 'DELETE' ? `Dihapus dari sistem` : log.type === 'EDIT' ? `Detail aset diperbarui` : `Aset diregistrasi`}
-                                            </p>
+                                       
+                                       <p className="text-xs font-bold text-slate-800 dark:text-white mb-1 leading-relaxed text-left">
+                                         {details}
+                                       </p>
+                                       
+                                       <div className="flex items-center justify-between mt-3 pt-2.5 border-t border-slate-100 dark:border-slate-800/60 text-[10px] font-mono text-slate-600 dark:text-slate-400">
+                                         <span className="flex items-center gap-1">
+                                           <Fingerprint size={10} className="text-slate-400" />
+                                           Operator: <strong className="text-slate-800 dark:text-slate-300 font-semibold">{log.operator}</strong>
+                                         </span>
+                                         {log.sessionName && (
+                                           <span className="bg-purple-50 dark:bg-purple-950/30 text-purple-600 dark:text-purple-400 px-1.5 py-0.5 rounded text-[8px] font-black uppercase">
+                                             Opname: {log.sessionName}
+                                           </span>
+                                         )}
                                        </div>
+                                     </div>
                                    </div>
-                               ))
-                           )}
-                        </div>
+                                 );
+                               })}
+                             </div>
+                           );
+                        })()}
                     </div>
                  </div>
                </motion.div>
@@ -2979,10 +3403,10 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
 
                         <div className="border border-slate-200 dark:border-slate-800 rounded-2xl overflow-hidden">
                            <div className="bg-slate-50 dark:bg-[#020617] p-4 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between">
-                              <h3 className="text-xs font-black uppercase text-slate-600 dark:text-slate-300 tracking-widest">Cadangan Tersedia</h3>
+                              <h3 className="text-xs font-black uppercase text-slate-600 dark:text-slate-300 tracking-widest">Cadangan Tersedia (Google Drive)</h3>
                               <button onClick={handleBackupToDrive} className="px-4 py-2 bg-cyan-600 hover:bg-cyan-500 text-slate-900 dark:text-white rounded-lg text-[10px] font-black uppercase tracking-widest flex items-center gap-2"><Upload size={14}/> Cadangkan Sekarang</button>
                            </div>
-                           <div className="bg-[#0f172a]/50 p-4 min-h-[200px] max-h-[300px] overflow-y-auto space-y-3">
+                           <div className="bg-[#0f172a]/50 p-4 min-h-[140px] max-h-[200px] overflow-y-auto space-y-3">
                                {driveBackups.length === 0 ? (
                                   <p className="text-center text-slate-600 dark:text-slate-400 font-bold text-xs py-10 uppercase">Belum ada file cadangan di Google Drive Anda.</p>
                                ) : driveBackups.map(file => (
@@ -2995,51 +3419,180 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                                ))}
                            </div>
                         </div>
+
+                        {/* Google Sheets Live Database Sync */}
+                        <div className="border border-slate-200 dark:border-slate-800 rounded-2xl overflow-hidden bg-slate-50/50 dark:bg-[#020617]/30 p-5 space-y-4 text-left">
+                           <div className="flex items-center justify-between border-b border-slate-200 dark:border-slate-800 pb-3">
+                              <div className="flex items-center gap-2">
+                                 <FileText size={16} className="text-emerald-500" />
+                                 <h3 className="text-xs font-black uppercase text-slate-800 dark:text-white tracking-widest text-left">Kolaborasi Google Sheets</h3>
+                              </div>
+                              {isSheetsSyncing && (
+                                 <span className="text-[10px] font-mono text-emerald-400 animate-pulse flex items-center gap-1">
+                                    <RefreshCw size={10} className="animate-spin" /> Sedang memperbarui...
+                                 </span>
+                              )}
+                           </div>
+
+                           {!sheetsSpreadsheetId ? (
+                              <div className="space-y-3 text-center sm:text-left">
+                                 <p className="text-[11px] text-slate-600 dark:text-slate-400 leading-relaxed text-left">
+                                    Sambungkan inventaris Anda ke Google Spreadsheet. Sistem akan otomatis membuat file <strong className="text-slate-800 dark:text-slate-200">"Database Inventaris Gudang"</strong> dengan tab terpisah untuk Aset dan Riwayat Mutasi yang ter-update secara otomatis.
+                                 </p>
+                                 <button 
+                                    onClick={handleConnectToSheets}
+                                    disabled={isSheetsSyncing}
+                                    className="w-full sm:w-auto px-4 py-2.5 bg-emerald-600 hover:bg-emerald-500 disabled:bg-emerald-900/40 text-white rounded-xl text-xs font-black uppercase tracking-widest shadow-[0_0_15px_rgba(16,185,129,0.25)] transition-colors"
+                                 >
+                                    Hubungkan & Buat Spreadsheet Baru
+                                 </button>
+                              </div>
+                           ) : (
+                              <div className="space-y-4">
+                                 <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 bg-white dark:bg-[#020617]/80 p-3.5 border border-slate-200 dark:border-slate-800 rounded-xl">
+                                    <div className="min-w-0 text-left">
+                                       <span className="inline-flex items-center gap-1.5 text-[8px] font-black tracking-widest bg-emerald-50 text-emerald-600 dark:bg-emerald-950/30 dark:text-emerald-400 px-2 py-0.5 rounded border border-emerald-200/50 dark:border-emerald-900/30 font-mono mb-1.5">
+                                          ● TERHUBUNG
+                                       </span>
+                                       <p className="text-xs font-black text-slate-800 dark:text-white uppercase truncate">Database Inventaris Gudang</p>
+                                    </div>
+                                    <a 
+                                       href={`https://docs.google.com/spreadsheets/d/${sheetsSpreadsheetId}/edit`}
+                                       target="_blank" 
+                                       rel="noopener noreferrer"
+                                       className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-800 dark:text-slate-200 rounded-lg text-[10px] font-black uppercase tracking-wider transition-colors shrink-0"
+                                    >
+                                       <FileText size={12} /> Buka Spreadsheet
+                                    </a>
+                                 </div>
+
+                                 <div className="flex items-center justify-between gap-4 py-1.5 border-t border-b border-slate-200 dark:border-slate-800">
+                                    <div className="text-left">
+                                       <p className="text-[11px] font-bold text-slate-800 dark:text-slate-200">Autosync Real-time (Latar Belakang)</p>
+                                       <p className="text-[9px] text-slate-600 dark:text-slate-400">Otomatis update Spreadsheet sesaat setelah database lokal atau Firebase diperbarui.</p>
+                                    </div>
+                                    <button 
+                                       onClick={() => handleToggleSheetsAutosync(!isSheetsAutosyncEnabled)}
+                                       className={`w-12 h-6 rounded-full p-1 transition-colors duration-200 ${
+                                          isSheetsAutosyncEnabled ? 'bg-emerald-500' : 'bg-slate-300 dark:bg-slate-800'
+                                       } relative flex items-center shrink-0`}
+                                    >
+                                       <span className={`w-4 h-4 bg-white rounded-full shadow-md transform transition-transform duration-200 ${
+                                          isSheetsAutosyncEnabled ? 'translate-x-[22px]' : 'translate-x-0'
+                                       }`} />
+                                    </button>
+                                 </div>
+
+                                 <div className="flex flex-col sm:flex-row gap-2">
+                                    <button 
+                                       onClick={handleSyncToSheets}
+                                       disabled={isSheetsSyncing}
+                                       className="flex-1 px-3 py-2.5 bg-slate-800 hover:bg-slate-750 border border-slate-700/60 text-slate-200 hover:text-white rounded-xl text-[10px] font-black uppercase tracking-widest transition-colors font-sans"
+                                    >
+                                       Kirim ke Sheets
+                                    </button>
+                                    <button 
+                                       onClick={handlePullFromSheets}
+                                       disabled={isSheetsSyncing}
+                                       className="flex-1 px-3 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-[10px] font-black uppercase tracking-widest shadow-[0_2px_10px_rgba(16,185,129,0.15)] transition-colors font-sans"
+                                    >
+                                       Tarik dari Sheets
+                                    </button>
+                                    <button 
+                                       onClick={() => {
+                                          if (confirm("Apakah Anda yakin ingin melepas koneksi Google Sheets?")) {
+                                             setSheetsSpreadsheetId(null);
+                                             safeStorage.removeItem("sheets_spreadsheet_id");
+                                          }
+                                       }}
+                                       className="px-3 py-2.5 bg-red-950/20 hover:bg-red-950/40 text-red-500 hover:text-red-400 border border-red-900/30 rounded-xl text-[10px] font-black uppercase tracking-wider transition-colors shrink-0 font-sans"
+                                    >
+                                       Putuskan
+                                    </button>
+                                 </div>
+
+                                 {/* BOT NOTIFIKASI EMAIL */}
+                                 <div className="border border-slate-200 dark:border-slate-800 rounded-2xl overflow-hidden bg-slate-50 dark:bg-[#020617]/50 p-5 mt-6 space-y-4 text-left">
+                                    <div className="flex items-center justify-between border-b border-slate-200 dark:border-slate-800 pb-3">
+                                       <div className="flex items-center gap-2">
+                                          <Bell size={16} className="text-cyan-500" />
+                                          <h3 className="text-xs font-black uppercase text-slate-800 dark:text-white tracking-widest text-left">Pemberitahuan Bot Email</h3>
+                                       </div>
+                                    </div>
+
+                                    <div className="space-y-4">
+                                       <div className="space-y-1.5">
+                                          <label className="text-[10px] font-black uppercase text-slate-600 dark:text-slate-400 tracking-wider">Email Alamat Penerima</label>
+                                          <input 
+                                             type="email" 
+                                             placeholder="contoh: ryo.kun4113@gmail.com" 
+                                             value={notificationEmail} 
+                                             onChange={(e) => {
+                                                setNotificationEmail(e.target.value);
+                                                safeStorage.setItem("notification_email", e.target.value);
+                                             }}
+                                             className="w-full bg-[#050b14]/50 border border-slate-200 dark:border-slate-800 dark:bg-[#020617] text-slate-900 dark:text-slate-100 rounded-xl px-4 py-2.5 text-xs focus:ring-1 focus:ring-cyan-500 focus:outline-none placeholder:text-slate-500"
+                                          />
+                                       </div>
+
+                                       <div className="flex items-center justify-between gap-4 py-1.5 border-t border-b border-slate-200 dark:border-slate-800">
+                                          <div className="text-left">
+                                             <p className="text-[11px] font-bold text-slate-800 dark:text-white">Aktifkan Notifikasi Email</p>
+                                             <p className="text-[9px] text-slate-600 dark:text-slate-400 font-sans">Kirim email otomatis saat ada scan check-in atau check-out.</p>
+                                          </div>
+                                          <button 
+                                             onClick={() => {
+                                                const nextEnabled = !isEmailNotificationEnabled;
+                                                setIsEmailNotificationEnabled(nextEnabled);
+                                                safeStorage.setItem("email_notification_enabled", nextEnabled ? "true" : "false");
+                                             }}
+                                             className={`w-12 h-6 rounded-full p-1 transition-colors duration-200 ${
+                                                isEmailNotificationEnabled ? 'bg-cyan-500' : 'bg-slate-300 dark:bg-slate-800'
+                                             } relative flex items-center shrink-0`}
+                                          >
+                                             <span className={`w-4 h-4 bg-white rounded-full shadow-md transform transition-transform duration-200 ${
+                                                isEmailNotificationEnabled ? 'translate-x-[22px]' : 'translate-x-0'
+                                             }`} />
+                                          </button>
+                                       </div>
+
+                                       <button
+                                          onClick={async () => {
+                                             if (!notificationEmail) {
+                                                alert("Harap masukkan alamat email yang valid terlebih dahulu.");
+                                                return;
+                                             }
+                                             try {
+                                                await sendTransactionEmail(
+                                                   notificationEmail, 
+                                                   "TEST KONEKSI - BOT NOTIFIKASI GUDANG", 
+                                                   `
+                                                     <div style="font-family: Arial, sans-serif; max-width: 600px; border: 1px solid #e2e8f0; border-radius: 12px; padding: 24px; color: #010409; background-color: #ffffff;">
+                                                        <h3 style="color: #06b6d4; font-size: 16px; margin-top: 0; padding-bottom: 10px; border-bottom: 1px solid #e2e8f0;">Koneksi Bot Berhasil!</h3>
+                                                        <p style="font-size: 13px; line-height: 1.6; color: #484f58;">Bot Notifikasi Gudang telah sukses terhubung ke email Anda. Mulai sekarang, rincian keluar-masuk senjata/aset akan dikirimkan ke sini secara instan.</p>
+                                                     </div>
+                                                   `
+                                                );
+                                                alert("Email uji coba berhasil dikirim! Periksa kotak masuk Anda.");
+                                             } catch (err) {
+                                                alert("Gagal kirim email uji coba: " + (err.message || err));
+                                             }
+                                          }}
+                                          className="w-full px-4 py-2.5 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-800 dark:text-slate-200 rounded-xl text-[10px] font-black uppercase tracking-wider transition-colors font-sans"
+                                       >
+                                          Kirim Email Uji Coba (Test Connection)
+                                       </button>
+                                    </div>
+                                 </div>
+                              </div>
+                           )}
+                        </div>
                     </div>
                  )}
                </motion.div>
             </motion.div>
           )}
         </AnimatePresence>
-
-        {/* Animated Custom In-App Overdue Push Notifications HUD */}
-        <div className="fixed top-20 right-6 z-[9999] p-4 flex flex-col gap-3 pointer-events-none max-w-sm w-full">
-          <AnimatePresence>
-            {overdueNotifications.map((item) => (
-              <motion.div
-                key={item.id}
-                initial={{ opacity: 0, x: 150, y: -20, scale: 0.9 }}
-                animate={{ opacity: 1, x: 0, y: 0, scale: 1 }}
-                exit={{ opacity: 0, x: 150, scale: 0.9 }}
-                transition={{ type: "spring", stiffness: 350, damping: 25 }}
-                className="bg-red-950/95 border border-red-500/50 backdrop-blur-md rounded-2xl p-4 shadow-[0_4px_25px_rgba(239,68,68,0.25)] ring-1 ring-red-500/20 pointer-events-auto overflow-hidden relative"
-              >
-                {/* Visual Alarm light effect */}
-                <div className="absolute inset-x-0 top-0 h-[2px] bg-gradient-to-r from-transparent via-red-500 to-transparent animate-pulse"></div>
-                <div className="flex gap-3">
-                  <div className="flex-shrink-0 w-10 h-10 rounded-xl bg-red-900/30 border border-red-500/30 flex items-center justify-center text-red-400 animate-pulse">
-                    <AlertTriangle size={18} className="animate-bounce" />
-                  </div>
-                  <div className="flex-1 text-left">
-                    <div className="flex justify-between items-start">
-                      <span className="text-[9px] font-black tracking-widest text-red-400 uppercase font-mono">PUSH ALERT: KETERLAMBATAN</span>
-                      <button 
-                        onClick={() => setClosedPushNotifs(prev => [...prev, item.id])}
-                        className="text-red-400 hover:text-white hover:bg-red-900/40 p-1 rounded-md transition-colors"
-                        title="Tutup Notifikasi"
-                      >
-                        <X size={12} />
-                      </button>
-                    </div>
-                    <p className="text-xs font-black text-white uppercase mt-1.5">{item.name}</p>
-                    <p className="text-[10px] font-mono font-medium text-red-300 mt-0.5">PEMEGANG: <span className="font-bold">{item.holder || "UNKNOWN"}</span></p>
-                    <p className="text-[9px] font-mono text-slate-400 mt-2">Batas waktu terlampaui. Segera lakukan penindakan pengembalian.</p>
-                  </div>
-                </div>
-              </motion.div>
-            ))}
-          </AnimatePresence>
-        </div>
 
         {/* J.A.R.V.I.S Assistant Element */}
         <JarvisAssistant 

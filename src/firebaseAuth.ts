@@ -7,6 +7,8 @@ export const auth = getAuth(app);
 
 const provider = new GoogleAuthProvider();
 provider.addScope('https://www.googleapis.com/auth/drive');
+provider.addScope('https://www.googleapis.com/auth/spreadsheets');
+provider.addScope('https://www.googleapis.com/auth/gmail.send');
 
 let isSigningIn = false;
 let cachedAccessToken: string | null = null;

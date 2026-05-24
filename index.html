@@ -1,9 +1,48 @@
 <!doctype html>
-<html lang="en">
+<html lang="id">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
     <title>Sistem Manajemen Gudang Senjata Batalyon B Pelopor</title>
+    
+    <!-- Active Cache Busting & Service Worker Obliterator -->
+    <script>
+      (function() {
+        // Unregister all old service workers immediately
+        if ('serviceWorker' in navigator) {
+          navigator.serviceWorker.getRegistrations().then(function(registrations) {
+            var unregisteredAny = false;
+            for (var i = 0; i < registrations.length; i++) {
+              registrations[i].unregister();
+              unregisteredAny = true;
+            }
+            if (unregisteredAny) {
+              console.log('Forcefully cleared active Service Worker.');
+              // Clear caches
+              if ('caches' in window) {
+                caches.keys().then(function(names) {
+                  for (var j = 0; j < names.length; j++) {
+                    caches.delete(names[j]);
+                  }
+                });
+              }
+              // Force-reload the page from server
+              setTimeout(function() {
+                window.location.reload(true);
+              }, 150);
+            }
+          });
+        }
+      })();
+    </script>
+
+    <!-- PWA & Mobile Web App Meta Tags -->
+    <link rel="manifest" href="/manifest.json" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Gudang Senjata" />
+    <meta name="theme-color" content="#061225" />
+    <link rel="apple-touch-icon" href="/vite.svg" />
   </head>
   <body>
     <div id="root"></div>

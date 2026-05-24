@@ -51,12 +51,16 @@ export const AuthScreen = ({
           console.error("Audio not supported");
         }
 
-        if ('speechSynthesis' in window) {
-          window.speechSynthesis.cancel();
-          const utterance = new SpeechSynthesisUtterance(type === 'success' ? 'Akses diterima' : 'Akses ditolak');
-          utterance.lang = 'id-ID';
-          utterance.rate = 1.1;
-          window.speechSynthesis.speak(utterance);
+        try {
+          if ('speechSynthesis' in window) {
+            window.speechSynthesis.cancel();
+            const utterance = new SpeechSynthesisUtterance(type === 'success' ? 'Akses diterima' : 'Akses ditolak');
+            utterance.lang = 'id-ID';
+            utterance.rate = 1.1;
+            window.speechSynthesis.speak(utterance);
+          }
+        } catch (e) {
+          console.warn("Speech synthesis is not supported or blocked by browser policies:", e);
         }
      };
 
@@ -66,17 +70,11 @@ export const AuthScreen = ({
       });
      
      if (matchedUser) {
-        if ('Notification' in window && Notification.permission !== 'granted' && Notification.permission !== 'denied') {
-            Notification.requestPermission();
-        }
         playSound('success');
         // Give time for sound to play before redirecting
         setTimeout(() => onSuccess(matchedUser), 1000);
      } else {
         playSound('error');
-        if ('Notification' in window && Notification.permission === 'granted') {
-            new Notification('Sistem Manajemen Gudang Senjata: Peringatan Akses', { body: `Akses login yang tidak dikenal terdeteksi (ID: ${loginId}).`, icon: '/vite.svg' });
-        }
         setTimeout(() => {
            alert("Akses Ditolak. Kredensial tidak valid.");
         }, 500);
