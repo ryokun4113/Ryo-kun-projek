@@ -1,6 +1,6 @@
 {
-  "name": "Sistem Gudang Senjata",
-  "description": "Sistem Kendali Inventaris Taktis dan manajemen aset gudang.",
+  "name": "Sistem Manajemen Gudang Senjata Batalyon B Pelopor",
+  "description": "Sistem Manajemen Gudang Senjata Batalyon B Pelopor - Developed by RYO KUN",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

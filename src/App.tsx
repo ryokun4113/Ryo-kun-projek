@@ -2,33 +2,58 @@ import React, { useState, useEffect, useRef } from "react";
 import { Html5QrcodeScanner } from "html5-qrcode";
 import * as XLSX from "xlsx";
 import { 
-  HeartHandshake, ShieldCheck, Shield, Camera, Layers, Search, 
+  HeartHandshake, ShieldCheck, Camera, Layers, Search, 
   Settings, LogOut, Package, Scan as ScanIcon, 
   Clock, LayoutDashboard, Cpu, PlusSquare, 
   ClipboardCheck, MessageSquare, Database, Download, 
   BellRing, FileText, ArrowRight, X, Phone, Fingerprint, Wifi,
   Upload, RefreshCw, Cloud, Bell, BarChart2, PieChart, AlertTriangle,
-  Calendar, History, Printer, ArrowDownRight, ArrowUpRight, GripHorizontal
+  Calendar, History, Printer, ArrowDownRight, ArrowUpRight, Trophy, Medal
 } from "lucide-react";
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from "recharts";
 import Barcode from 'react-barcode';
+import { QRCodeSVG } from "qrcode.react";
 import { collection, doc, setDoc, deleteDoc, onSnapshot, query, orderBy, writeBatch } from "firebase/firestore";
 import { db } from "./firebase";
-import { motion, AnimatePresence, Reorder } from "motion/react";
+import { motion, AnimatePresence } from "motion/react";
 import { AuthScreen } from "./AuthScreen";
 import { initAuth, googleSignIn, logout as googleLogout, getAccessToken } from "./firebaseAuth";
+import { JarvisAssistant } from "./components/JarvisAssistant";
 import { backupToDrive, restoreFromDrive, listBackupFilesInDrive } from "./driveSystem";
 import type { User as FirebaseUser } from "firebase/auth";
-import { Item, Log } from "./types";
-import { toast } from 'sonner';
+
+type Item = {
+  id: string;
+  name: string;
+  category: string;
+  serial: string;
+  popor: string;
+  holder: string;
+  note: string;
+  status: "Di Gudang" | "Keluar";
+  date: string;
+  customOverdueHours?: number;
+  outTimestamp?: number;
+  dueDate?: number;
+};
+
+type Log = {
+  id: string;
+  name: string;
+  status: string;
+  type: string;
+  holder: string;
+  time: string;
+  fullDate: string;
+  operator: string;
+  timestamp: number;
+  sessionName?: string;
+};
 
 import { MetricsWidget, ChartWidget, PieWidget, LogsWidget } from "./components/DashboardWidgets";
-import { JarvisAssistant } from "./components/JarvisAssistant";
-import { SidebarClock } from "./components/SidebarClock";
-import { PrintLabels } from "./components/PrintLabels";
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<"dashboard" | "scanner" | "inventory" | "add" | "opname" | "leaderboard" | "users" | "profile" | "print-labels">("dashboard");
+  const [activeTab, setActiveTab] = useState<"dashboard" | "scanner" | "inventory" | "add" | "opname" | "leaderboard" | "users">("dashboard");
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
   const [inventory, setInventory] = useState<Item[]>([]);
   const [logs, setLogs] = useState<Log[]>([]);
@@ -53,7 +78,20 @@ export default function App() {
   }, []);
 
   const handlePrint = (ctx: any) => {
-    setPrintContext({...ctx, scale: Math.min(100, Math.floor((window.innerWidth - 450) / 800 * 100))});
+    setPrintContext(ctx);
+    // Dynamic timeout based on volume: bulk barcodes need more time to initialize DOM elements
+    let timeout = 1200;
+    if (ctx.type === 'inventory-selection') {
+      const count = ctx.ids?.length || 0;
+      timeout = count > 20 ? 5000 : 3500;
+    } else if (ctx.type === 'barcode-roll') {
+      const count = ctx.ids?.length || 0;
+      timeout = count > 10 ? 4000 : 3000;
+    }
+    
+    setTimeout(() => {
+      window.print();
+    }, timeout);
   };
   
   // Scanner state
@@ -62,7 +100,7 @@ export default function App() {
   const [holderInput, setHolderInput] = useState("");
   const [sessionNameInput, setSessionNameInput] = useState("");
   const [rapidScan, setRapidScan] = useState(false);
-  const [overdueHoursInput, setOverdueHoursInput] = useState<number | ''>(24);
+  const [overdueHoursInput, setOverdueHoursInput] = useState<number | ''>(8);
 
   // Added states for missing html features
   const [appSettings, setAppSettings] = useState({ 
@@ -80,6 +118,7 @@ export default function App() {
   const [autoLogout, setAutoLogout] = useState(true);
   const [currentTime, setCurrentTime] = useState(new Date());
   const [dashboardListType, setDashboardListType] = useState<"Total" | "Tersedia" | "Keluar" | null>(null);
+  const [closedPushNotifs, setClosedPushNotifs] = useState<string[]>([]);
   
   const [dashboardLayout, setDashboardLayout] = useState<string[]>(() => {
     const saved = localStorage.getItem('ryo_dashboard_layout');
@@ -163,46 +202,15 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const overdueItems = inventory.filter(i => i.status === 'Keluar' && i.dueDate && Date.now() > i.dueDate);
-    const overdueIds = new Set(overdueItems.map(i => i.id));
+    if (!("Notification" in window) || Notification.permission !== "granted") return;
 
-    // Clear items that are no longer overdue from the ref
-    notifiedOverdueRef.current.forEach(id => {
-      if (!overdueIds.has(id)) {
-        notifiedOverdueRef.current.delete(id);
-      }
-    });
+    const overdueItems = inventory.filter(i => i.status === 'Keluar' && i.dueDate && Date.now() > i.dueDate);
     
     overdueItems.forEach(item => {
       if (!notifiedOverdueRef.current.has(item.id)) {
-        // On-screen notification
-        toast.custom((t) => (
-          <motion.div 
-            initial={{ opacity: 0, scale: 0.8, y: 20, rotateX: -20 }}
-            animate={{ opacity: 1, scale: 1, y: 0, rotateX: 0 }}
-            exit={{ opacity: 0, scale: 0.8 }}
-            transition={{ type: "spring", stiffness: 300, damping: 20 }}
-            className="w-full bg-red-950 border-2 border-red-500 text-white p-4 rounded-2xl shadow-[0_0_40px_rgba(220,38,38,0.4)] flex items-center gap-4 relative overflow-hidden"
-          >
-             <div className="bg-red-600 p-2 rounded-full relative z-10 animate-pulse">
-                <AlertTriangle size={24} className="text-white" />
-             </div>
-             <div className="flex-1 relative z-10">
-                <h4 className="font-black text-sm uppercase tracking-widest text-red-400">Aset Overdue!</h4>
-                <p className="text-xs mt-1 text-slate-200"><span className="font-bold text-white">{item.name}</span> [{item.id}] belum dikembalikan oleh <span className="font-bold text-red-300">{item.holder}</span></p>
-             </div>
-             <button onClick={() => { setActiveTab('dashboard'); toast.dismiss(t); }} className="relative z-10 bg-red-600 hover:bg-red-500 text-xs font-black px-3 py-2 rounded-xl uppercase transition-colors shadow-lg">
-               Lihat
-             </button>
-          </motion.div>
-        ), { duration: Infinity });
-
-        // Push notification if permitted
-        if ("Notification" in window && Notification.permission === "granted") {
-          new Notification("PERINGATAN GUDANG - OVERDUE", {
-            body: `ASET: ${item.name} [${item.id}]\nBelum dikembalikan oleh: ${item.holder}`,
-          });
-        }
+        new Notification("PERINGATAN GUDANG - OVERDUE", {
+          body: `ASET: ${item.name} [${item.id}]\nBelum dikembalikan oleh: ${item.holder}`,
+        });
         
         const tConfigStr = localStorage.getItem('ryo_telegram');
         const tConfig = tConfigStr ? JSON.parse(tConfigStr) : { botToken: "", chatId: "" };
@@ -246,47 +254,78 @@ export default function App() {
     return data;
   }, [logs]);
 
-  const leaderboardStats = React.useMemo(() => {
-    const operatorStats: Record<string, number> = {};
-    const holderStats: Record<string, { onTime: number; late: number }> = {};
-    const currentMonth = new Date().getMonth();
-
+  const operatorStats = React.useMemo(() => {
+    const stats: Record<string, { total: number; scansOut: number; scansIn: number; adds: number }> = {};
+    users.forEach(u => {
+      const uname = (u?.username || "UNKNOWN").toUpperCase();
+      stats[uname] = { total: 0, scansOut: 0, scansIn: 0, adds: 0 };
+    });
     logs.forEach(log => {
-        // Operator metrics (monthly)
-        const logMonth = new Date(log.timestamp).getMonth();
-        if (logMonth === currentMonth) {
-            operatorStats[log.operator] = (operatorStats[log.operator] || 0) + 1;
-        }
+      const op = (log.operator || "SYSTEM").toUpperCase();
+      if (!stats[op]) {
+        stats[op] = { total: 0, scansOut: 0, scansIn: 0, adds: 0 };
+      }
+      stats[op].total += 1;
+      if (log.type === "OUT") stats[op].scansOut += 1;
+      else if (log.type === "IN") stats[op].scansIn += 1;
+      else if (log.type === "ADD") stats[op].adds += 1;
+    });
+    return Object.entries(stats)
+      .map(([username, data]) => ({ name: username, ...data }))
+      .sort((a, b) => b.total - a.total);
+  }, [logs, users]);
 
-        // Personnel metrics
-        if (log.type === "IN" && log.holder && log.holder !== "-") {
-            if (!holderStats[log.holder]) holderStats[log.holder] = { onTime: 0, late: 0 };
-            if (log.isOverdue === true) {
-                holderStats[log.holder].late += 1;
-            } else if (log.isOverdue === false) {
-                holderStats[log.holder].onTime += 1;
-            }
-        }
+  const holderStats = React.useMemo(() => {
+    const stats: Record<string, { total: number; scansOut: number; scansIn: number; days: Set<string> }> = {};
+    
+    logs.forEach(log => {
+      if (!log.holder || log.holder === "-" || log.holder === "SISTEM") return;
+      const h = log.holder.toString().toUpperCase();
+      if (!stats[h]) {
+        stats[h] = { total: 0, scansOut: 0, scansIn: 0, days: new Set() };
+      }
+      stats[h].total += 1;
+      if (log.type === "OUT") stats[h].scansOut += 1;
+      else if (log.type === "IN") stats[h].scansIn += 1;
+      if (log.fullDate) stats[h].days.add(log.fullDate);
     });
 
-    const topOperators = Object.entries(operatorStats)
-      .map(([name, count]) => ({ name, count }))
-      .sort((a, b) => b.count - a.count)
-      .slice(0, 5);
-
-    const holderArr = Object.entries(holderStats).map(([name, data]) => ({ name, ...data }));
-    const topDisciplined = [...holderArr]
-      .filter(h => h.onTime > 0)
-      .sort((a, b) => b.onTime - a.onTime || a.late - b.late)
-      .slice(0, 5);
-      
-    const topLate = [...holderArr]
-      .filter(h => h.late > 0)
-      .sort((a, b) => b.late - a.late || a.onTime - b.onTime)
-      .slice(0, 5);
-
-    return { topOperators, topDisciplined, topLate };
+    return Object.entries(stats)
+      .map(([name, data]) => {
+        const uniqueDays = data.days.size;
+        // Logic: frequency (total) + consistency (unique days)
+        const score = (data.total * 10) + (uniqueDays * 50);
+        return {
+          name,
+          total: data.total,
+          scansOut: data.scansOut,
+          scansIn: data.scansIn,
+          uniqueDays,
+          score
+        };
+      })
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 10); // Top 10
   }, [logs]);
+
+  const peakHours = React.useMemo(() => {
+    const hours = { pagi: 0, siang: 0, sore: 0, malam: 0 };
+    logs.forEach(log => {
+      const ts = log.timestamp;
+      if (!ts) return;
+      const dateObj = new Date(ts);
+      const hour = dateObj.getHours();
+      if (hour >= 6 && hour < 12) hours.pagi += 1;
+      else if (hour >= 12 && hour < 18) hours.siang += 1;
+      else if (hour >= 18 && hour < 24) hours.sore += 1;
+      else hours.malam += 1;
+    });
+    return hours;
+  }, [logs]);
+
+  const overdueNotifications = React.useMemo(() => {
+    return inventory.filter(i => i.status === 'Keluar' && i.dueDate && Date.now() > i.dueDate && !closedPushNotifs.includes(i.id));
+  }, [inventory, closedPushNotifs]);
 
   useEffect(() => {
     const timer = setInterval(() => {
@@ -365,13 +404,23 @@ export default function App() {
    const speakAnnouncement = (item: Item, isOut: boolean) => {
     if ('speechSynthesis' in window) {
       const msg = new SpeechSynthesisUtterance();
-      const holderText = item.holder && item.holder !== "-" ? item.holder : "tidak diketahui";
-      const poporText = item.popor && item.popor !== "-" ? `nomor popor ${item.popor} ` : "";
-      const actionText = isOut ? "telah keluar gudang" : "telah dikembalikan ke gudang";
-      msg.text = `Aset ${item.name} atas nama ${holderText} ${poporText}${actionText}.`;
-      msg.lang = 'id-ID';
       
-      // cancel previous speech if any
+      const hasHolder = item.holder && item.holder !== "-" && item.holder !== "";
+      const holderPart = hasHolder ? `atas nama ${item.holder}` : "";
+      
+      const hasPopor = item.popor && item.popor !== "-" && item.popor !== "";
+      const poporPart = hasPopor ? `nomor popor ${item.popor}` : "";
+      
+      const nameText = item.name.toLowerCase();
+      const actionText = isOut ? "telah keluar dari gudang" : "telah kembali masuk gudang";
+      
+      const announcement = [nameText, holderPart, poporPart, actionText].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+      msg.text = announcement;
+      
+      msg.lang = 'id-ID';
+      msg.rate = 0.9;
+      msg.pitch = 1;
+      
       window.speechSynthesis.cancel();
       window.speechSynthesis.speak(msg);
     }
@@ -385,7 +434,7 @@ export default function App() {
       const item = inventory[itemIndex];
       const isOut = item.status === "Di Gudang";
       
-      const newHolder = isOut ? (holderInput ? holderInput.toUpperCase() : item.holder) : "-";
+      const newHolder = isOut ? (holderInput || item.holder) : "-";
       
       const updatedItem: any = {
         ...item,
@@ -395,7 +444,7 @@ export default function App() {
 
       if (isOut) {
         updatedItem.outTimestamp = Date.now();
-        const alarmHours = typeof overdueHoursInput === 'number' ? overdueHoursInput : 24;
+        const alarmHours = typeof overdueHoursInput === 'number' ? overdueHoursInput : 8;
         updatedItem.dueDate = Date.now() + alarmHours * 3600000;
       } else {
         updatedItem.outTimestamp = null;
@@ -407,15 +456,12 @@ export default function App() {
         name: item.name,
         status: isOut ? "Keluar" : "Di Gudang",
         type: isOut ? "OUT" : "IN",
-        holder: isOut ? newHolder : item.holder, // Keep track of who returned it!
+        holder: newHolder,
         time: new Date().toLocaleTimeString('id-ID'),
         fullDate: new Date().toLocaleDateString('id-ID'),
         operator: currentUser?.username || "SYSTEM",
         timestamp: Date.now()
       };
-      if (!isOut && item.dueDate) {
-          newLog.isOverdue = Date.now() > item.dueDate;
-      }
       if (sessionNameInput) {
         newLog.sessionName = sessionNameInput;
       }
@@ -426,7 +472,7 @@ export default function App() {
         batch.set(doc(collection(db, "logs")), newLog);
         await batch.commit();
         
-        speakAnnouncement({ ...item, holder: newHolder }, isOut);
+        speakAnnouncement({ ...item, holder: isOut ? newHolder : item.holder }, isOut);
         
         if (!rapidScan) {
           alert(`[${isOut ? 'OUT' : 'IN'}] ${item.name} berhasil di-scan.`);
@@ -929,7 +975,7 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
         alert("Alarm hanya dapat diatur untuk aset yang sedang keluar.");
         return;
       }
-      const hourInput = prompt(`Atur alarm overdue untuk ${item.name}. Masukkan jumlah jam (contoh: 2 untuk 2 jam, 24 untuk 1 hari):`, "24");
+      const hourInput = prompt(`Atur alarm overdue untuk ${item.name}. Masukkan jumlah jam (contoh: 2 untuk 2 jam, 24 untuk 1 hari):`, "8");
       if (hourInput && !isNaN(Number(hourInput))) {
         const hours = Number(hourInput);
         const due = Date.now() + hours * 3600000;
@@ -975,6 +1021,15 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
     }
   }, []);
 
+  useEffect(() => {
+    localStorage.setItem('ryo_theme', appTheme);
+    if (appTheme === 'dark') {
+      document.documentElement.classList.add('dark');
+    } else {
+      document.documentElement.classList.remove('dark');
+    }
+  }, [appTheme]);
+
   const toggleTheme = () => {
     const newTheme = appTheme === 'dark' ? 'light' : 'dark';
     setAppTheme(newTheme);
@@ -987,107 +1042,40 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
 
   return (
     <div className={`${appTheme === 'dark' ? 'dark' : ''} w-full h-full`}>
+      <div className="scanline-overlay opacity-0 dark:opacity-100"></div>
+      <div className="fixed inset-0 bg-tactical-grid opacity-0 dark:opacity-[0.03] pointer-events-none z-0"></div>
+      
     <div className={`h-screen flex flex-col md:flex-row overflow-hidden relative ${isLiteMode ? 'bg-slate-50 dark:bg-[#020617]' : 'bg-radar dark:bg-radar'} print:bg-white print:block print:h-auto print:overflow-visible transition-colors duration-500`}>
-            {/* Print View Layer */}
+      {/* Decorative Labels */}
+      <div className="fixed left-0 top-1/2 -translate-y-1/2 -rotate-90 origin-left ml-2 hidden lg:block z-0 opacity-0 dark:opacity-20 pointer-events-none">
+        <p className="text-[9px] font-black text-emerald-500 uppercase tracking-[0.6em] whitespace-nowrap">{"TACTICAL INVENTORY (V5.2)"}</p>
+      </div>
+      <div className="fixed right-0 top-1/2 -translate-y-1/2 rotate-90 origin-right mr-2 hidden lg:block z-0 opacity-0 dark:opacity-20 pointer-events-none">
+        <p className="text-[9px] font-black text-emerald-500 uppercase tracking-[0.6em] whitespace-nowrap">{"SECURED SYSTEM"}</p>
+      </div>
+      {/* Print View Layer */}
       {printContext && (
-        <div className="fixed inset-0 z-[99999] bg-slate-900/80 backdrop-blur-sm flex p-4 md:p-8 print:p-0 print:bg-white print:block">
-          <div className="w-80 bg-white dark:bg-slate-900 flex-shrink-0 flex flex-col p-6 rounded-2xl print:hidden shadow-[0_30px_60px_rgba(0,0,0,0.4)] relative mr-6 z-[100000]">
-            <h2 className="text-lg font-black uppercase mb-4 text-slate-900 dark:text-white border-b border-slate-200 dark:border-slate-800 pb-4 flex items-center gap-2">
-               <Printer className="text-emerald-500" /> Print Preview
-            </h2>
-            {/* Controls */}
-            <div className="space-y-3 mt-2">
-               <button onClick={() => { setTimeout(() => window.print(), 100); }} className="w-full bg-blue-600 hover:bg-blue-700 text-white font-black py-4 rounded-xl text-sm uppercase tracking-widest transition-colors flex justify-center items-center gap-2 shadow-lg shadow-blue-900/20 cyber-cut"><Printer size={16} /> Cetak Sekarang</button>
-               <button onClick={() => setPrintContext(null)} className="w-full bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-800 dark:text-slate-200 font-black py-4 rounded-xl text-sm uppercase tracking-widest transition-colors shadow-sm cyber-cut">Batal</button>
-            </div>
-            {/* Configs */}
-            <div className="mt-8 space-y-6 flex-1 overflow-y-auto custom-scrollbar pr-2 pb-6">
-               <h3 className="font-bold text-[10px] text-slate-400 uppercase tracking-widest border-b border-slate-200 dark:border-slate-800 pb-2">Pengaturan Layar</h3>
-               
-               {printContext.type === 'inventory-selection' && (
-                 <label className="flex items-center gap-3 text-sm font-bold text-slate-700 dark:text-slate-300 bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-700 p-4 rounded-xl cursor-pointer hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors">
-                   <input type="checkbox" checked={printContext.compact} onChange={(e) => setPrintContext({...printContext, compact: e.target.checked})} className="w-4 h-4 accent-emerald-500" />
-                   Compact Mode
-                 </label>
-               )}
-
-               <div className="bg-slate-50 dark:bg-[#020617]/50 border border-slate-200 dark:border-slate-800 p-4 rounded-xl space-y-4">
-                  {printContext.type !== 'barcode-roll' && (
-                    <>
-                    <div>
-                      <label className="flex text-[10px] font-black text-slate-700 dark:text-slate-300 mb-2 tracking-widest uppercase">Orientasi Kertas (A4)</label>
-                      <select value={printContext.orientation || 'portrait'} onChange={e => setPrintContext({...printContext, orientation: e.target.value})} className="w-full bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-lg p-3 text-xs uppercase font-bold outline-none text-slate-800 dark:text-slate-200 focus:border-emerald-500 cyber-cut">
-                         <option value="portrait">Portrait (Tegak)</option>
-                         <option value="landscape">Landscape (Mendatar)</option>
-                      </select>
-                    </div>
-                    <div>
-                      <label className="flex text-[10px] font-black text-slate-700 dark:text-slate-300 mb-2 tracking-widest uppercase">Margin Dokumen</label>
-                      <select value={printContext.margin || '10mm'} onChange={e => setPrintContext({...printContext, margin: e.target.value})} className="w-full bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-lg p-3 text-xs uppercase font-bold outline-none text-slate-800 dark:text-slate-200 focus:border-emerald-500 cyber-cut">
-                         <option value="5mm">Sempit (5mm)</option>
-                         <option value="10mm">Normal (10mm)</option>
-                         <option value="20mm">Lebar (20mm)</option>
-                      </select>
-                    </div>
-                    <hr className="border-slate-200 dark:border-slate-700/50" />
-                    </>
-                  )}
-                  <div>
-                    <label className="flex justify-between items-center text-[10px] font-black text-slate-700 dark:text-slate-300 mb-4 tracking-widest uppercase">
-                      <span>Skala Preview Layar</span>
-                      <span className="text-emerald-600 dark:text-emerald-500 bg-emerald-100 dark:bg-emerald-900/30 px-2 py-0.5 rounded shadow-sm">{printContext.scale || 100}%</span>
-                    </label>
-                    <input type="range" min="30" max="150" step="5" value={printContext.scale || 100} onChange={(e) => setPrintContext({...printContext, scale: Number(e.target.value)})} className="w-full accent-emerald-500 outline-none hover:opacity-80 transition-opacity" />
-                    <p className="text-[8px] text-slate-500 mt-3 font-semibold uppercase tracking-widest leading-relaxed border-t border-slate-200 dark:border-slate-800 pt-3">
-                       <AlertTriangle size={10} className="inline mr-1 text-orange-500 mb-0.5" /> Hanya zoom visual untuk preview, TIDAK berpengaruh ke hasil cetak asli.
-                    </p>
-                  </div>
-               </div>
-               
-               <div className="bg-blue-50 dark:bg-blue-900/10 border border-blue-200 dark:border-blue-900/40 p-4 rounded-xl">
-                  <h4 className="text-[9px] font-black uppercase text-blue-600 dark:text-blue-400 tracking-widest mb-2 flex items-center gap-1">
-                     <Settings size={12} /> Panduan Setting Browser
-                  </h4>
-                  <ul className="text-[9px] text-blue-800/80 dark:text-blue-300/80 font-bold space-y-2 uppercase leading-relaxed tracking-wide">
-                     <li className="flex items-start gap-1"><span className="text-blue-500 mt-0.5">•</span> Pastikan <span className="font-black text-blue-600 dark:text-blue-400">Paper Size</span> diatur ke A4 atau Roll Sticker di dialog cetak browser.</li>
-                     <li className="flex items-start gap-1"><span className="text-blue-500 mt-0.5">•</span> Centang opsi <span className="font-black text-blue-600 dark:text-blue-400">Background Graphics</span> agar warna latar tercetak.</li>
-                     <li className="flex items-start gap-1"><span className="text-blue-500 mt-0.5">•</span> Set Margins ke <span className="font-black text-blue-600 dark:text-blue-400">Minimum/None</span> jika menggunakan mode Roll Barcode agar desain fit ke kertas.</li>
-                  </ul>
-               </div>
-            </div>
-          </div>
-          
-          <div className="flex-1 bg-slate-200 dark:bg-[#050b14]/90 border border-slate-300 dark:border-slate-800 rounded-2xl overflow-auto flex py-10 justify-center print:p-0 print:border-none print:bg-white print:rounded-none relative shadow-[inset_0_4px_24px_rgba(0,0,0,0.05)] dark:shadow-none custom-scrollbar print:!overflow-visible print:!block z-10 w-full">
-             {/* Dynamic Canvas Container for Preview */}
-             <div className="flex justify-center items-start print:block print:w-full print:h-full">
-                 {/* A4 Paper Canvas (or customized) */}
-                 <div 
-                   id="print-canvas"
-                   className="bg-white relative origin-top text-black print:!block print:!w-full print:!m-0 print:!scale-100 print:!transform-none print:shadow-none"
-                   style={{
-                      width: printContext.type === 'barcode-roll' ? '100mm' : '210mm',
-                      minHeight: printContext.type === 'barcode-roll' ? 'auto' : '297mm',
-                      maxWidth: '100%',
-                      padding: printContext.type === 'barcode-roll' ? '0' : '10mm',
-                      marginBottom: '40px',
-                      boxShadow: '0 20px 50px rgba(0,0,0,0.15)',
-                      transform: `scale(${(printContext.scale || 100)/100})`
-                   }}
-                 >
-                   <div className="print-content-wrapper w-full h-full bg-white print:bg-transparent">
+        <div className="absolute inset-0 w-full min-h-screen bg-white z-[99999] text-black print:static print:overflow-visible print:h-auto print:min-h-0 print:block">
+            {/* Close Button (Hidden during print) */}
+            <button 
+              onClick={() => setPrintContext(null)}
+              className="fixed top-4 right-4 z-[100000] p-3 bg-red-600 text-white rounded-full shadow-2xl hover:bg-red-700 transition-all active:scale-95 print:hidden group flex items-center gap-2"
+              title="Tutup Preview Cetak"
+            >
+              <X size={20} />
+              <span className="text-[10px] font-black uppercase tracking-widest overflow-hidden w-0 group-hover:w-24 transition-all duration-300">Tutup Preview</span>
+            </button>
 
             <style>
               {printContext.type === 'barcode-roll' ? `
                 @media print {
                   @page { margin: 0; size: auto; }
                   body { background: white !important; margin: 0; padding: 0; }
-                  #print-canvas { transform: none !important; box-shadow: none !important; margin: 0 !important; width: 100% !important; }
                 }
               ` : `
                 @media print { 
-                  @page { size: A4 ${printContext.orientation || 'portrait'}; margin: ${printContext.margin || '10mm'}; } 
+                  @page { size: A4; margin: 5mm; } 
                   body { background: white !important; -webkit-print-color-adjust: exact; color-adjust: exact; } 
-                  #print-canvas { transform: none !important; box-shadow: none !important; margin: 0 !important; width: 100% !important; }
                 }
               `}
             </style>
@@ -1096,8 +1084,9 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
             {printContext.type !== 'inventory-selection' && printContext.type !== 'barcode-roll' && (
                 <div className="border-b-2 border-black pb-4 mb-6 flex items-center justify-between p-4 print:p-0">
                     <div>
-                        <h1 className="text-2xl font-black uppercase tracking-tight">Sistem Gudang Senjata</h1>
-                        <p className="text-sm font-bold mt-1">BATALYON B PELOPOR - DOKUMEN RESMI</p>
+                        <h1 className="text-2xl font-black uppercase tracking-tight">SISTEM MANAJEMEN GUDANG SENJATA</h1>
+                        <p className="text-sm font-bold mt-1">BATALYON B PELOPOR</p>
+                        <p className="text-[10px] font-medium text-slate-500 mt-1">Developed by RYO KUN</p>
                     </div>
                     <div className="text-right">
                         <p className="text-xs font-mono">TANGGAL CETAK</p>
@@ -1109,11 +1098,36 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
 
             {/* Print Type: Selection Barcodes */}
             {printContext.type === 'inventory-selection' && (
-                <div className={`flex flex-wrap p-2 print:p-0 justify-start items-start ${printContext.compact ? 'gap-0 print:gap-0' : 'gap-1 print:gap-1'}`}>
-                    {inventory.filter(i => printContext.ids.includes(i.id)).map(item => (
-                        <div key={item.id} className={`border border-black flex flex-col justify-center items-center text-center bg-white w-fit ${printContext.compact ? 'p-[2px]' : 'p-0.5'}`} style={{ pageBreakInside: 'avoid', breakInside: 'avoid' }}>
-                            <div className={`truncate font-black uppercase leading-none mb-0.5 ${printContext.compact ? 'max-w-[85px] print:max-w-[100px] text-[7px] print:text-[8px]' : 'max-w-[100px] print:max-w-[120px] text-[8px] print:text-[9px]'}`}>{item.name}</div>
-                            <Barcode value={item.id} width={printContext.compact ? 1 : 1.2} height={printContext.compact ? 22 : 26} fontSize={printContext.compact ? 8 : 9} textPosition="bottom" margin={0} background="#ffffff" lineColor="#000000" displayValue={true} />
+                <div className={`flex flex-wrap p-1 print:p-0 justify-start items-start ${printContext.compact ? 'gap-1 print:gap-1.5' : 'gap-1.5 print:gap-2'}`}>
+                    {inventory
+                      .filter(i => printContext.ids.includes(i.id))
+                      .sort((a, b) => a.id.localeCompare(b.id, undefined, { numeric: true, sensitivity: 'base' }))
+                      .map(item => (
+                        <div key={item.id} className={`border border-black/50 flex flex-col justify-start items-center text-center bg-white w-fit ${printContext.compact ? 'p-0.5' : 'p-1'}`} style={{ pageBreakInside: 'avoid', breakInside: 'avoid', margin: '1px' }}>
+                            <div className={`truncate font-black uppercase leading-tight mb-0.5 border-b border-black w-full bg-slate-50 ${printContext.compact ? 'max-w-[110px] print:max-w-[120px] text-[7px] print:text-[8px]' : 'max-w-[140px] print:max-w-[160px] text-[8px] print:text-[9px]'}`}>{item.name}</div>
+                            
+                            <div className="flex items-center gap-2 px-1">
+                                <div className="p-0.5">
+                                    <Barcode 
+                                      value={item.id} 
+                                      width={printContext.compact ? 1.0 : 1.2} 
+                                      height={printContext.compact ? 22 : 30} 
+                                      fontSize={printContext.compact ? 8 : 9} 
+                                      textPosition="bottom" 
+                                      margin={2} 
+                                      background="#ffffff" 
+                                      lineColor="#000000" 
+                                      displayValue={true} 
+                                      renderer="svg"
+                                      format="CODE128"
+                                    />
+                                </div>
+                                
+                                {/* QR Code Side-by-Side - Now enabled for both modes with scaling */}
+                                <div className={`pl-2 border-l border-black/20 py-1 flex items-center justify-center`}>
+                                  <QRCodeSVG value={item.id} size={printContext.compact ? 32 : 44} includeMargin={false} />
+                                </div>
+                            </div>
                         </div>
                     ))}
                 </div>
@@ -1121,18 +1135,43 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
 
             {/* Print Type: Barcode Roll */}
             {printContext.type === 'barcode-roll' && (
-                <div className="flex flex-col m-0 p-0">
-                    {inventory.filter(i => printContext.ids.includes(i.id)).map((item, index) => (
-                        <div key={item.id} style={{ pageBreakAfter: 'always', breakAfter: 'always', width: '100%', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: '10px 0', boxSizing: 'border-box' }} className="barcode-roll-label">
-                            <div className="font-black uppercase text-[12px] print:text-[14px] leading-tight text-center max-w-[90%] truncate">{item.name}</div>
-                            {item.serial && <div className="font-bold text-[8px] print:text-[10px] leading-tight text-center mb-1 max-w-[90%] truncate">SN: {item.serial}</div>}
-                            <Barcode value={item.id} width={1.8} height={40} fontSize={12} textPosition="bottom" margin={0} background="#ffffff" lineColor="#000000" displayValue={true} />
+                <div className="flex flex-col m-0 p-0 items-center gap-4">
+                    {inventory
+                      .filter(i => printContext.ids.includes(i.id))
+                      .sort((a, b) => a.id.localeCompare(b.id, undefined, { numeric: true, sensitivity: 'base' }))
+                      .map((item, index) => (
+                        <div key={item.id} style={{ pageBreakAfter: 'always', breakAfter: 'always', width: '100%', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: '12px 0', boxSizing: 'border-box' }} className="barcode-roll-label">
+                            <div className="font-black uppercase text-[15px] print:text-[18px] leading-tight text-center max-w-[90%] truncate">{item.name}</div>
+                            {item.serial && <div className="font-bold text-[9px] print:text-[11px] leading-tight text-center mb-1 max-w-[90%] truncate text-slate-700">SN: {item.serial}</div>}
+                            
+                            <div className="flex items-center gap-4 mt-2 px-4 py-2 border border-black/10 rounded-lg bg-slate-50/50">
+                                <div className="flex flex-col items-center">
+                                    <Barcode 
+                                      value={item.id} 
+                                      width={2.2} 
+                                      height={55} 
+                                      fontSize={14} 
+                                      textPosition="bottom" 
+                                      margin={4} 
+                                      background="transparent" 
+                                      lineColor="#000000" 
+                                      displayValue={true} 
+                                      renderer="svg"
+                                      format="CODE128"
+                                    />
+                                </div>
+                                <div className="border-l border-black/20 pl-4 flex items-center justify-center">
+                                  <div className="border border-black p-1 bg-white shadow-sm">
+                                    <QRCodeSVG value={item.id} size={65} includeMargin={false} />
+                                  </div>
+                                </div>
+                            </div>
                         </div>
                     ))}
                 </div>
             )}
 
-            {/* Print Type: Logs History */}
+             {/* Print Type: Logs History */}
             {printContext.type.startsWith('logs-') && (() => {
                 const filteredLogs = logs.filter(l => {
                     if (printContext.type === 'logs-today') return l.fullDate === new Date().toLocaleDateString('id-ID');
@@ -1140,18 +1179,31 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                     return l.fullDate === y.toLocaleDateString('id-ID');
                 });
                 
-                const logsStillOut = filteredLogs.filter(log => {
-                    const currentItem = inventory.find(i => i.id === log.id);
-                    return currentItem && currentItem.status === 'Keluar';
+                const sortedFilteredLogs = [...filteredLogs].sort((a, b) => b.timestamp - a.timestamp);
+                const latestLogMap = new Map();
+                sortedFilteredLogs.forEach(log => {
+                    if (!latestLogMap.has(log.id)) {
+                        latestLogMap.set(log.id, log);
+                    }
                 });
+
+                const logsStillOut = [];
+                const logsInsideOrOther = [];
                 
-                const logsInsideOrOther = filteredLogs.filter(log => {
+                filteredLogs.forEach(log => {
+                    const latestLog = latestLogMap.get(log.id);
                     const currentItem = inventory.find(i => i.id === log.id);
-                    return !currentItem || currentItem.status !== 'Keluar';
+                    const isCurrentlyOut = currentItem && currentItem.status === 'Keluar';
+                    
+                    if (isCurrentlyOut && log.timestamp === latestLog.timestamp && log.type === 'OUT') {
+                        logsStillOut.push(log);
+                    } else {
+                        logsInsideOrOther.push(log);
+                    }
                 });
 
                 return (
-                <div>
+                <div className="animate-in fade-in slide-in-from-bottom-4 duration-500">
                    <h2 className="text-sm font-black uppercase mb-1 py-1 border-b-[1.5px] border-black border-dotted print:mt-[-10px]">
                      LAPORAN MUTASI ASET - {
                         printContext.type === 'logs-today' ? "HARI INI (" + new Date().toLocaleDateString('id-ID') + ")" :
@@ -1159,22 +1211,22 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                      }
                    </h2>
 
-                   <h3 className="text-[10px] font-black uppercase mt-4 mb-2">Tabel 1: Aset Yang Masih Di Luar Gudang (Belum Kembali)</h3>
-                   <table className="w-full text-left text-[7px] print:text-[8px] leading-tight mb-6">
-                     <thead className="border-b-[1.5px] border-black font-black">
+                   <h3 className="text-[10px] font-black uppercase mt-4 mb-2 text-red-600">BAGIAN 1: ASET YANG MASIH DI LUAR GUDANG (BELUM KEMBALI / MERAH)</h3>
+                   <table className="w-full text-left text-[7px] print:text-[8px] leading-tight mb-6 border-collapse">
+                     <thead className="border-b-[1.5px] border-black font-black bg-red-50">
                        <tr>
                          <th className="py-1 px-1">WAKTU</th>
                          <th className="py-1 px-1">TIPE</th>
                          <th className="py-1 px-1">SKU</th>
                          <th className="py-1 px-1">NAMA ASET</th>
-                         <th className="py-1 px-1">STATUS</th>
-                         <th className="py-1 px-1">KETERANGAN/PEMEGANG</th>
+                         <th className="py-1 px-1">STATUS SEKARANG</th>
+                         <th className="py-1 px-1">PEMEGANG SAAT INI</th>
                          <th className="py-1 px-1">OP</th>
                        </tr>
                      </thead>
                      <tbody className="divide-y divide-black/20 font-mono">
                        {logsStillOut.map(log => (
-                         <tr key={log.timestamp} className="break-inside-avoid text-red-600 print:text-red-700 font-bold">
+                         <tr key={log.timestamp} className="break-inside-avoid text-red-600 print:text-red-700 font-bold bg-red-50/30">
                            <td className="py-1 px-1 whitespace-nowrap">{log.time}</td>
                            <td className="py-1 px-1">
                               {log.type === 'IN' && <span className="font-black border border-current px-0.5 py-px">IN</span>}
@@ -1191,34 +1243,34 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                          </tr>
                        ))}
                        {logsStillOut.length === 0 && (
-                          <tr><td colSpan={7} className="text-center py-4 font-bold border-b border-black text-black print:text-black">TIDAK ADA ASET YANG MASIH DI LUAR.</td></tr>
+                          <tr><td colSpan={7} className="text-center py-4 font-bold border-b border-black text-slate-500">SELURUH ASET YANG KELUAR SUDAH KEMBALI KE GUDANG.</td></tr>
                        )}
                      </tbody>
                    </table>
 
-                   <h3 className="text-[10px] font-black uppercase mt-4 mb-2">Tabel 2: Aset Yang Sudah Kembali & Mutasi Lainnya</h3>
-                   <table className="w-full text-left text-[7px] print:text-[8px] leading-tight">
-                     <thead className="border-b-[1.5px] border-black font-black">
+                   <h3 className="text-[10px] font-black uppercase mt-4 mb-2 text-slate-800">BAGIAN 2: RIWAYAT MUTASI / ASET YANG SUDAH KEMBALI</h3>
+                   <table className="w-full text-left text-[7px] print:text-[8px] leading-tight border-collapse">
+                     <thead className="border-b-[1.5px] border-black font-black bg-slate-50">
                        <tr>
                          <th className="py-1 px-1">WAKTU</th>
                          <th className="py-1 px-1">TIPE</th>
                          <th className="py-1 px-1">SKU</th>
                          <th className="py-1 px-1">NAMA ASET</th>
-                         <th className="py-1 px-1">STATUS</th>
-                         <th className="py-1 px-1">KETERANGAN/PEMEGANG</th>
+                         <th className="py-1 px-1">STATUS LOG</th>
+                         <th className="py-1 px-1">KETERANGAN</th>
                          <th className="py-1 px-1">OP</th>
                        </tr>
                      </thead>
-                     <tbody className="divide-y divide-black/20 font-mono font-medium">
+                     <tbody className="divide-y divide-black/20 font-mono text-black font-medium">
                        {logsInsideOrOther.map(log => (
                          <tr key={log.timestamp} className="break-inside-avoid">
                            <td className="py-0.5 px-1 whitespace-nowrap">{log.time}</td>
                            <td className="py-0.5 px-1">
-                              {log.type === 'IN' && <span className="font-black border border-black px-0.5 py-px bg-gray-100">IN</span>}
-                              {log.type === 'OUT' && <span className="font-black border border-black px-0.5 py-px bg-gray-100 border-dashed">OUT</span>}
-                              {log.type === 'ADD' && <span className="font-black">ADD</span>}
-                              {log.type === 'DELETE' && <span className="font-black line-through">DEL</span>}
-                              {log.type === 'EDIT' && <span className="font-black border border-black px-0.5 py-px bg-gray-100 border-dotted">EDIT</span>}
+                              {log.type === 'IN' && <span className="font-black border border-black px-0.5 py-px bg-gray-100 uppercase">IN</span>}
+                              {log.type === 'OUT' && <span className="font-black border border-black px-0.5 py-px bg-gray-100 border-dashed uppercase">OUT</span>}
+                              {log.type === 'ADD' && <span className="font-black uppercase">ADD</span>}
+                              {log.type === 'DELETE' && <span className="font-black line-through uppercase">DEL</span>}
+                              {log.type === 'EDIT' && <span className="font-black border border-black px-0.5 py-px bg-gray-100 border-dotted uppercase">EDIT</span>}
                            </td>
                            <td className="py-0.5 px-1">{log.id}</td>
                            <td className="py-0.5 px-1 font-black">{log.name}</td>
@@ -1228,7 +1280,7 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                          </tr>
                        ))}
                        {logsInsideOrOther.length === 0 && (
-                           <tr><td colSpan={7} className="text-center py-4 font-bold border-b border-black">TIDAK ADA DATA LOG TAMBAHAN.</td></tr>
+                            <tr><td colSpan={7} className="text-center py-4 font-bold border-b border-black">TIDAK ADA DATA LOG MUTASI LAINNYA.</td></tr>
                        )}
                      </tbody>
                    </table>
@@ -1241,11 +1293,7 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                    </div>
                 </div>
                 );
-            })}
-                   </div>
-                 </div>
-             </div>
-          </div>
+            })()}
         </div>
       )}
 
@@ -1259,12 +1307,14 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
             <div className="absolute -top-1 -right-1 w-3 h-3 bg-emerald-500 rounded-full border-2 border-[#020617] animate-pulse"></div>
           </div>
           <div className="flex flex-col">
-            <h1 className="text-[12px] font-black text-slate-900 dark:text-white italic tracking-tighter uppercase leading-tight">
-              SISTEM GUDANG SENJATA <span className="text-[8px] font-medium text-slate-600 dark:text-slate-400 not-italic block normal-case tracking-normal">Developed by Ryo Kun</span>
+            <h1 className="text-[10px] font-black text-slate-900 dark:text-white italic tracking-tighter uppercase leading-[1.1]">
+              SISTEM MANAJEMEN GUDANG SENJATA
             </h1>
-            <span className={`flex items-center gap-1 text-[8px] font-bold tracking-widest uppercase mt-1 ${isOnline ? 'text-emerald-500' : 'text-red-500'}`}>
-              <span className={`w-1.5 h-1.5 rounded-full animate-pulse ${isOnline ? 'bg-emerald-500' : 'bg-red-500'}`}></span>
-              {isOnline ? 'DATABASE TERHUBUNG' : 'OFFLINE • SINKRONISASI TERTUNDA'}
+            <span className="text-[9px] font-bold text-emerald-600 dark:text-emerald-500 uppercase tracking-tighter">BATALYON B PELOPOR</span>
+            <span className="text-[7px] font-medium text-slate-500 dark:text-slate-400 not-italic block normal-case tracking-normal">Developed by RYO KUN</span>
+            <span className={`flex items-center gap-1.5 text-[7px] font-black tracking-widest uppercase mt-0.5 ${isOnline ? 'text-emerald-500' : 'text-red-500'}`}>
+              <span className={`w-1.5 h-1.5 rounded-full animate-pulse ${isOnline ? 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)]' : 'bg-red-500'}`}></span>
+              {isOnline ? 'DATABASE TERHUBUNG' : 'SERVER DISCONNECTED'}
             </span>
           </div>
         </div>
@@ -1293,10 +1343,11 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
             <div className="inline-flex p-3 bg-emerald-600 rounded-2xl mb-4 cyber-cut">
               <ShieldCheck className="text-white w-6 h-6 md:w-8 md:h-8" />
             </div>
-            <h1 className="text-lg md:text-xl font-black text-slate-900 dark:text-white italic tracking-tighter leading-tight">
-              SISTEM GUDANG SENJATA<br/><span className="uppercase text-emerald-600 dark:text-emerald-500">BATALYON B PELOPOR</span>
-            </h1>
-            <p className="text-[10px] text-slate-600 dark:text-slate-400 mt-2 font-medium">Developed by Ryo Kun</p>
+                    <h1 className="text-lg font-black text-slate-900 dark:text-white italic tracking-tighter leading-[0.9] uppercase">
+                      SISTEM MANAJEMEN<br/>GUDANG SENJATA
+                    </h1>
+                    <p className="text-emerald-600 dark:text-emerald-500 text-xs font-black tracking-[0.2em] mt-2 uppercase">BATALYON B PELOPOR</p>
+            <p className="text-[10px] text-slate-600 dark:text-slate-400 mt-2 font-black uppercase tracking-widest">Developed by RYO KUN</p>
         </div>
         <nav className="flex-1 p-6 space-y-3 overflow-y-auto">
           <p className="text-[10px] font-black text-slate-600 uppercase tracking-[0.2em] mb-4">Menu Utama</p>
@@ -1312,9 +1363,6 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
           <button onClick={() => { setActiveTab('add'); setIsMobileMenuOpen(false); }} className={`sidebar-item btn-interact w-full flex items-center gap-4 px-5 py-4 rounded-2xl border transition-all ${activeTab === 'add' ? 'bg-emerald-50 dark:bg-emerald-950/30 border-emerald-100 dark:border-emerald-900/50 shadow-sm text-emerald-600 dark:text-emerald-400' : 'border-transparent text-slate-600 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-800/40 hover:text-slate-900 dark:hover:text-slate-200'}`}>
             <PlusSquare size={20} /><span className="font-bold text-sm">Registrasi Baru</span>
           </button>
-          <button onClick={() => { setActiveTab('print-labels'); setIsMobileMenuOpen(false); }} className={`sidebar-item btn-interact w-full flex items-center gap-4 px-5 py-4 rounded-2xl border transition-all ${activeTab === 'print-labels' ? 'bg-emerald-50 dark:bg-emerald-950/30 border-emerald-100 dark:border-emerald-900/50 shadow-sm text-emerald-600 dark:text-emerald-400' : 'border-transparent text-slate-600 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-800/40 hover:text-slate-900 dark:hover:text-slate-200'}`}>
-            <Printer size={20} /><span className="font-bold text-sm">Cetak Label QR</span>
-          </button>
           <button onClick={() => { setActiveTab('opname'); setIsMobileMenuOpen(false); }} className={`sidebar-item btn-interact w-full flex items-center gap-4 px-5 py-4 rounded-2xl border transition-all ${activeTab === 'opname' ? 'bg-emerald-50 dark:bg-emerald-950/30 border-emerald-100 dark:border-emerald-900/50 shadow-sm text-emerald-600 dark:text-emerald-400' : 'border-transparent text-slate-600 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-800/40 hover:text-slate-900 dark:hover:text-slate-200'}`}>
             <ClipboardCheck size={20} /><span className="font-bold text-sm">Stock Opname</span>
           </button>
@@ -1328,7 +1376,6 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
             <Fingerprint size={20} /><span className="font-bold text-sm">Profil Admin</span>
           </button>
         </nav>
-        
         <div className="p-6 border-t border-slate-200 dark:border-slate-800 shrink-0">
             <div className="flex justify-between items-center gap-3">
                 <div className="flex items-center gap-3">
@@ -1348,9 +1395,6 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                     </button>
                 </div>
             </div>
-            
-            <SidebarClock />
-
             <div className="mt-4 bg-slate-50 dark:bg-[#020617] border border-slate-200 dark:border-slate-800 rounded-xl p-3 flex justify-between items-center">
               <div className="text-left">
                 <p className="text-[8px] font-black text-slate-600 dark:text-slate-400 uppercase tracking-widest">Auto Logout 2 Jam</p>
@@ -1365,34 +1409,59 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                 {autoLogout ? 'OFF-KAN' : 'ON-KAN'}
               </button>
             </div>
+
+            {/* Tactical Chronometer Clock Sidebar Footer */}
+            <div className="mt-4 p-4 mx-3 bg-slate-50 dark:bg-[#020617] rounded-xl border border-slate-200 dark:border-slate-800 flex justify-between items-center transition-colors">
+              <div className="text-left">
+                <p className="text-[8px] font-black text-slate-500 dark:text-cyan-400 tracking-wider uppercase">TACTICAL CHRONO</p>
+                <p className="text-lg font-mono font-black text-slate-900 dark:text-cyan-300 drop-shadow-[0_0_8px_rgba(34,211,238,0.2)] mt-0.5">
+                  {formatTimeString(currentTime)}
+                </p>
+              </div>
+              <div className="text-right">
+                <span className="text-[9px] font-bold text-slate-500 font-mono">
+                  {currentTime.toLocaleDateString('id-ID', { day: 'numeric', month: 'short' }).toUpperCase()}
+                </span>
+                <span className="block text-[8px] font-bold text-emerald-500 animate-pulse mt-0.5">● LIVE SYNC</span>
+              </div>
+            </div>
         </div>
       </aside>
 
       {/* Main content */}
-      <main className="flex-1 flex flex-col relative w-full h-full overflow-hidden print:overflow-visible print:h-auto">
+      <main className="flex-1 flex flex-col relative w-full h-full overflow-hidden print:hidden">
         
         {/* Persistent Tactical Status Bar */}
-        <div className="flex-none p-3 px-6 border-b border-slate-200 dark:border-slate-800/80 bg-slate-50 dark:bg-[#020617]/90 backdrop-blur-md z-40 flex justify-between items-center hidden md:flex mt-16 md:mt-0 print:hidden">
-           <div className="flex items-center gap-4">
-              <span className="text-[10px] font-black text-slate-600 dark:text-slate-400 uppercase tracking-[0.2em]">System Status:</span>
-              <span className={`flex items-center gap-2 text-[10px] font-black uppercase px-3 py-1.5 rounded-full border ${isOnline ? 'bg-emerald-950/40 text-emerald-500 border-emerald-900/50 shadow-[0_0_10px_rgba(16,185,129,0.1)]' : 'bg-red-950/40 text-red-500 border-red-900/50 shadow-[0_0_10px_rgba(239,68,68,0.1)]'}`}>
-                <span className={`w-1.5 h-1.5 rounded-full animate-pulse ${isOnline ? 'bg-emerald-500' : 'bg-red-500'}`}></span>
-                <Database size={12} />
-                {isOnline ? 'DATABASE TERHUBUNG' : 'DATABASE OFFLINE (MENYIMPAN LOKAL)'}
-              </span>
-           </div>
-           <div className="flex items-center gap-4">
-              <div className="flex items-center gap-2 bg-white dark:bg-slate-900/50 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-800">
-                  <Clock size={12} className="text-emerald-500" />
-                  <span className="text-[12px] font-mono font-bold text-emerald-400">{formatTimeString(currentTime)}</span>
+        <div className="flex-none p-3 px-6 border-b border-slate-200 dark:border-slate-800/80 bg-slate-50 dark:bg-[#020617]/95 backdrop-blur-md z-40 flex justify-between items-center hidden md:flex mt-16 md:mt-0 shadow-lg shadow-black/5">
+           <div className="flex items-center gap-6">
+              <div className="flex items-center gap-2">
+                 <span className="text-[10px] font-black text-slate-500 dark:text-slate-400 uppercase tracking-[0.2em] opacity-60">System Status:</span>
+                 <span className={`flex items-center gap-2 text-[10px] font-black uppercase px-3 py-1.5 rounded-full border ${isOnline ? 'bg-emerald-950/40 text-emerald-500 border-emerald-900/50 shadow-[0_0_10px_rgba(16,185,129,0.2)]' : 'bg-red-950/40 text-red-500 border-red-900/50 shadow-[0_0_10px_rgba(239,68,68,0.2)]'}`}>
+                   <span className={`w-1.5 h-1.5 rounded-full animate-pulse ${isOnline ? 'bg-emerald-500' : 'bg-red-500'}`}></span>
+                   {isOnline ? 'DATABASE ONLINE' : 'DATABASE OFFLINE (LOKAL)'}
+                 </span>
               </div>
-              <span className="text-[10px] font-mono text-slate-600 dark:text-slate-400">
-                {currentTime.toLocaleDateString('id-ID', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}
-              </span>
+              
+              <div className="flex items-center gap-2 border-l border-slate-300 dark:border-slate-800 pl-6 group">
+                 <Wifi size={12} className={isOnline ? "text-emerald-500" : "text-red-500"} />
+                 <span className="text-[10px] font-black text-slate-600 dark:text-slate-400 uppercase tracking-widest group-hover:text-emerald-400 transition-colors">Net: {isOnline ? 'Stable' : 'Unstable'}</span>
+              </div>
+              
+              <div className="flex items-center gap-2 border-l border-slate-300 dark:border-slate-800 pl-6">
+                 <Cpu size={12} className="text-blue-500" />
+                 <span className="text-[10px] font-black text-slate-600 dark:text-slate-400 uppercase tracking-widest">Core: V5.2-Alpha</span>
+              </div>
+           </div>
+           
+           <div className="flex items-center gap-4">
+              <div className="flex flex-col items-end">
+                 <p className="text-[11px] font-mono font-bold text-slate-900 dark:text-emerald-400 tracking-tighter bg-slate-200 dark:bg-slate-950/80 px-3 py-1.5 rounded-md border border-slate-300 dark:border-slate-800">
+                    {currentTime.toLocaleTimeString('id-ID')}
+                 </p>
+              </div>
            </div>
         </div>
-
-        <div className="flex-1 overflow-y-auto px-4 md:px-6 pt-6 pb-12 custom-scrollbar print:overflow-visible print:px-0 print:pt-0">
+         <div className="flex-1 overflow-y-auto px-4 md:px-6 pt-6 pb-12 custom-scrollbar">
           <AnimatePresence mode="wait">
             <motion.div
               key={activeTab}
@@ -1438,7 +1507,7 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                                            <BellRing size={10} /> Atur Ulang Alarm
                                         </button>
                                     </div>
-                                    <span className="text-orange-500 font-bold">Dipinjam: {item.holder}</span>
+                                    <span className="text-orange-500 font-bold uppercase">PEMEGANG: {item.holder}</span>
                                   </li>
                                 ))}
                               </ul>
@@ -1500,12 +1569,12 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
              
              <div className="flex justify-between items-start">
                <div className="flex flex-col">
-                  <h2 className="text-3xl md:text-5xl font-black text-slate-900 dark:text-white italic tracking-tighter uppercase leading-tight relative">
-                    <span className="text-emerald-500/30 text-4xl mr-2 absolute -left-6 top-0 md:top-2">[</span>
-                    STATUS GUDANG<br/>SENJATA
-                    <span className="text-emerald-500/30 text-4xl ml-2 absolute -right-6 bottom-0 md:-bottom-2">]</span>
-                  </h2>
-                  <p className="text-slate-600 dark:text-slate-400 text-xs md:text-sm font-bold uppercase tracking-widest mt-2">SISTEM KENDALI INVENTARIS TAKTIS</p>
+                   <h2 className="text-5xl md:text-7xl font-black text-slate-900 dark:text-white italic tracking-tighter uppercase leading-[0.8] relative group cursor-default">
+                     <span className="text-emerald-500/10 text-3xl md:text-5xl mr-2 absolute -left-8 md:-left-12 top-0 pointer-events-none select-none">[</span>
+                     COMMAND<br/>CENTER
+                     <span className="text-emerald-500/20 text-3xl md:text-5xl ml-2 absolute -right-8 md:-right-12 bottom-0 pointer-events-none select-none">]</span>
+                   </h2>
+                  <p className="text-slate-500 dark:text-slate-400 text-[10px] md:text-xs font-black uppercase tracking-[0.3em] mt-2 border-l-2 border-emerald-500 pl-3">Sistem Kendali Inventaris Taktis V5.2</p>
                </div>
                
                {/* Top Right Badges & Bell */}
@@ -1569,17 +1638,18 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                      <MessageSquare size={20} className="mb-2" />
                      <span className="text-[9px] font-black uppercase tracking-widest text-center leading-tight">SETUP<br/>BOT</span>
                  </button>
-                 <input type="file" ref={fileInputRef} onChange={handleRestoreDB} accept=".json" className="hidden" />
              </div>
 
-             {/* Draggable Dashboard Layout */}
-             <Reorder.Group axis="y" values={dashboardLayout} onReorder={setDashboardLayout} className="space-y-6 mt-6 pb-20">
+             {/* Static Dashboard Layout */}
+             <div className="space-y-6 mt-6 pb-20">
                 {dashboardLayout.map((widgetId) => (
-                   <Reorder.Item key={widgetId} value={widgetId} className="relative z-0 group">
-                      <div className="absolute top-2 right-2 md:-right-6 md:top-1/2 md:-translate-y-1/2 cursor-grab active:cursor-grabbing p-1.5 md:p-2 bg-slate-200 dark:bg-slate-800 rounded-lg text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 z-[60] transition-colors opacity-100 md:opacity-0 group-hover:opacity-100 flex items-center shadow-lg pointer-events-auto border border-slate-300 dark:border-slate-700" title="Tahan dan geser untuk memindahkan layout">
-                          <GripHorizontal size={16} />
-                      </div>
-                      
+                   <motion.div 
+                     key={widgetId} 
+                     initial={{ opacity: 0, y: 20 }}
+                     animate={{ opacity: 1, y: 0 }}
+                     transition={{ duration: 0.4 }}
+                     className="relative z-0 group"
+                   >
                       {widgetId === 'metrics' && (
                          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
                             <MetricsWidget inventory={inventory} dashboardListType={dashboardListType} setDashboardListType={setDashboardListType} />
@@ -1597,9 +1667,9 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                       {widgetId === 'logs' && (
                          <LogsWidget logs={logs} />
                       )}
-                   </Reorder.Item>
+                   </motion.div>
                 ))}
-             </Reorder.Group>
+             </div>
           </div>
         )}
 
@@ -1661,26 +1731,26 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
               </div>
 
               {/* Advanced Scan Buttons */}
-              <div className="mt-6 flex flex-col sm:flex-row flex-wrap items-center justify-center gap-4">
-                  <div className="flex items-center gap-3">
-                     <label className="relative inline-flex items-center cursor-pointer">
-                        <input type="checkbox" checked={rapidScan} onChange={(e) => setRapidScan(e.target.checked)} className="sr-only peer" />
-                        <div className="w-9 h-5 bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-slate-300"></div>
-                     </label>
-                     <span className="text-[10px] font-black text-slate-600 dark:text-slate-400 uppercase tracking-widest">RAPID SCAN</span>
-                  </div>
-                  <button 
-                    onClick={() => setCameraActive(!cameraActive)}
-                    className="flex items-center gap-2 bg-emerald-50 dark:bg-emerald-900/30 text-emerald-600 dark:text-emerald-500 border border-emerald-200 dark:border-emerald-900/50 px-4 py-2.5 rounded-full text-[10px] font-black uppercase tracking-widest hover:bg-emerald-100 dark:hover:bg-emerald-900/50 transition-colors shadow-sm dark:shadow-none"
-                  >
-                     <Camera size={14} /> SCAN KAMERA PERANGKAT
-                  </button>
-                  <button 
-                    onClick={() => handlePrint({ type: 'logs-today' })}
-                    className="flex items-center gap-2 bg-blue-50 dark:bg-blue-900/30 text-blue-600 dark:text-blue-500 border border-blue-200 dark:border-blue-900/50 px-4 py-2.5 rounded-full text-[10px] font-black uppercase tracking-widest hover:bg-blue-100 dark:hover:bg-blue-900/50 transition-colors shadow-sm dark:shadow-none"
-                  >
-                     <Printer size={14} /> CETAK MUTASI HARI INI
-                  </button>
+              <div className="mt-8 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                   <div className="flex items-center justify-center gap-4 bg-slate-50 dark:bg-slate-900/40 p-3 rounded-xl border border-slate-200 dark:border-slate-800">
+                      <label className="relative inline-flex items-center cursor-pointer">
+                         <input type="checkbox" checked={rapidScan} onChange={(e) => setRapidScan(e.target.checked)} className="sr-only peer" />
+                         <div className="w-9 h-5 bg-slate-400 dark:bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-emerald-500"></div>
+                      </label>
+                      <span className="text-[10px] font-black text-slate-600 dark:text-slate-400 uppercase tracking-widest">RAPID SCAN MODE</span>
+                   </div>
+                   <button 
+                     onClick={() => setCameraActive(!cameraActive)}
+                     className="flex items-center justify-center gap-2 bg-emerald-50 dark:bg-emerald-900/30 text-emerald-600 dark:text-emerald-500 border border-emerald-200 dark:border-emerald-900/50 px-6 py-4 rounded-xl text-[10px] font-black uppercase tracking-widest hover:bg-emerald-100 dark:hover:bg-emerald-900/50 transition-all shadow-sm dark:shadow-none btn-interact group"
+                   >
+                      <Camera size={18} className="group-hover:scale-110 transition-transform" /> AKTIFKAN KAMERA
+                   </button>
+                   <button 
+                     onClick={() => handlePrint({ type: 'logs-today' })}
+                     className="flex items-center justify-center gap-2 bg-blue-50 dark:bg-blue-900/30 text-blue-600 dark:text-blue-500 border border-blue-200 dark:border-blue-900/50 px-6 py-4 rounded-xl text-[10px] font-black uppercase tracking-widest hover:bg-blue-100 dark:hover:bg-blue-900/50 transition-all shadow-sm dark:shadow-none btn-interact group sm:col-span-2 lg:col-span-1"
+                   >
+                      <Printer size={18} className="group-hover:scale-110 transition-transform" /> CETAK MUTASI HARI INI
+                   </button>
               </div>
 
               {/* Actual mobile scanner view using html5-qrcode */}
@@ -1721,10 +1791,19 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                       ) : (
                         <div className="space-y-3">
                           {logs.filter(l => l.fullDate === new Date().toLocaleDateString('id-ID')).map((log, idx) => (
-                            <div key={idx} className="flex justify-between items-center text-xs border-b border-slate-200 dark:border-slate-800/50 pb-2">
-                              <span className="font-mono text-emerald-500">{log.time}</span>
-                              <span className="font-bold text-slate-900 dark:text-white uppercase">{log.name}</span>
-                              <span className={`text-[9px] font-black uppercase px-2 py-0.5 rounded ${log.status === 'Keluar' ? 'bg-orange-900/40 text-orange-400' : 'bg-emerald-900/40 text-emerald-400'}`}>{log.status}</span>
+                            <div key={idx} className="grid grid-cols-[80px_1fr_80px] items-start gap-3 text-[11px] border-b border-slate-200 dark:border-slate-800/50 pb-2.5 mb-2 last:border-0 last:pb-0 last:mb-0">
+                               <span className="font-mono text-emerald-500 font-bold mt-0.5">{log.time.split(' ').pop()}</span>
+                               <div className="flex flex-col min-w-0">
+                                 <span className="font-black text-slate-900 dark:text-white uppercase truncate">{log.name}</span>
+                                 <div className="flex items-center gap-2 mt-0.5 opacity-70">
+                                   <span className="text-[8px] text-slate-500 dark:text-slate-400 font-bold uppercase tracking-tight truncate">PEMEGANG: {log.holder && log.holder !== '-' ? log.holder : 'SISTEM'}</span>
+                                 </div>
+                               </div>
+                               <div className="flex justify-end">
+                                 <span className={`text-[9px] font-black uppercase px-2 py-0.5 rounded-md border min-w-[75px] text-center shadow-sm ${log.status === 'Keluar' ? 'bg-orange-500/10 text-orange-500 border-orange-500/30' : 'bg-emerald-500/10 text-emerald-500 border-emerald-500/30'}`}>
+                                   {log.status === 'Keluar' ? 'KELUAR' : 'MASUK'}
+                                 </span>
+                               </div>
                             </div>
                           ))}
                         </div>
@@ -1749,10 +1828,19 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                       ) : (
                         <div className="space-y-3">
                           {logs.filter(l => { const y = new Date(); y.setDate(y.getDate() - 1); return l.fullDate === y.toLocaleDateString('id-ID'); }).map((log, idx) => (
-                            <div key={idx} className="flex justify-between items-center text-xs border-b border-slate-200 dark:border-slate-800/50 pb-2">
-                              <span className="font-mono text-emerald-500">{log.time}</span>
-                              <span className="font-bold text-slate-900 dark:text-white uppercase">{log.name}</span>
-                              <span className={`text-[9px] font-black uppercase px-2 py-0.5 rounded ${log.status === 'Keluar' ? 'bg-orange-900/40 text-orange-400' : 'bg-emerald-900/40 text-emerald-400'}`}>{log.status}</span>
+                            <div key={idx} className="grid grid-cols-[80px_1fr_80px] items-start gap-3 text-[11px] border-b border-slate-200 dark:border-slate-800/50 pb-2.5 mb-2 last:border-0 last:pb-0 last:mb-0">
+                               <span className="font-mono text-emerald-500 font-bold mt-0.5">{log.time.split(' ').pop()}</span>
+                               <div className="flex flex-col min-w-0">
+                                 <span className="font-black text-slate-900 dark:text-white uppercase truncate">{log.name}</span>
+                                 <div className="flex items-center gap-2 mt-0.5 opacity-70">
+                                   <span className="text-[8px] text-slate-500 dark:text-slate-400 font-bold uppercase tracking-tight truncate">PEMEGANG: {log.holder && log.holder !== '-' ? log.holder : 'SISTEM'}</span>
+                                 </div>
+                               </div>
+                               <div className="flex justify-end">
+                                 <span className={`text-[9px] font-black uppercase px-2 py-0.5 rounded-md border min-w-[75px] text-center shadow-sm ${log.status === 'Keluar' ? 'bg-orange-500/10 text-orange-500 border-orange-500/30' : 'bg-emerald-500/10 text-emerald-500 border-emerald-500/30'}`}>
+                                   {log.status === 'Keluar' ? 'KELUAR' : 'MASUK'}
+                                 </span>
+                               </div>
                             </div>
                           ))}
                         </div>
@@ -2195,69 +2283,240 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
         )}
 
         {activeTab === 'leaderboard' && (
-          <div className="max-w-4xl mx-auto py-10 animate-in fade-in">
-              <h2 className="text-2xl md:text-3xl font-black text-slate-900 dark:text-white italic uppercase text-center mb-6"><span className="text-emerald-500/50 mr-2">[</span>Papan Kinerja<span className="text-emerald-500/50 ml-2">]</span></h2>
+          <div className="max-w-5xl mx-auto py-10 animate-in fade-in transition-all">
+              <h2 className="text-2xl md:text-3xl font-black text-slate-900 dark:text-white italic uppercase text-center mb-8">
+                <span className="text-emerald-500/50 mr-2">[</span>Papan Kinerja Taktis<span className="text-emerald-500/50 ml-2">]</span>
+              </h2>
               
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                <div className="bg-white dark:bg-[#1e293b] p-6 rounded-[30px] border border-slate-200 dark:border-slate-800 text-center bg-carbon">
-                   <h3 className="text-sm font-black text-slate-900 dark:text-white uppercase tracking-wider mb-2 flex justify-center items-center gap-2">Paling Disiplin <Shield size={16} className="text-emerald-500" /></h3>
-                   <p className="text-slate-600 dark:text-slate-400 text-[10px] uppercase mb-4 tracking-widest">Pengembalian Tepat Waktu</p>
-                   <div className="bg-slate-50 dark:bg-[#020617] rounded-2xl p-4 border border-slate-200 dark:border-slate-800 text-left">
-                       {leaderboardStats.topDisciplined.length === 0 ? (
-                         <p className="text-slate-500 font-mono text-xs text-center py-4">Belum ada data</p>
-                       ) : (
-                         <ul className="space-y-3">
-                           {leaderboardStats.topDisciplined.map((item, idx) => (
-                             <li key={item.name} className="flex justify-between items-center bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-3 rounded-xl border-l-4 border-l-emerald-500">
-                               <span className="text-emerald-700 dark:text-emerald-500 font-bold text-sm uppercase">{idx + 1}. {item.name}</span>
-                               <span className="text-slate-600 dark:text-slate-400 text-xs font-mono">{item.onTime}x Tepat</span>
-                             </li>
-                           ))}
-                         </ul>
-                       )}
-                   </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
+                {/* Metric Card 1 */}
+                <div className="bg-white dark:bg-[#1e293b]/55 p-6 rounded-[24px] border border-slate-200 dark:border-slate-800 relative overflow-hidden group">
+                  <span className="absolute top-3 left-3 w-2 h-2 border-t border-l border-cyan-500"></span>
+                  <p className="text-[9px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest">Total Operasi Log</p>
+                  <p className="text-4xl font-black text-slate-900 dark:text-white mt-2 font-mono">{logs.length}</p>
+                  <p className="text-[10px] text-emerald-500 font-bold mt-1 uppercase">● Seluruh Waktu</p>
                 </div>
-
-                <div className="bg-white dark:bg-[#1e293b] p-6 rounded-[30px] border border-slate-200 dark:border-slate-800 text-center bg-carbon">
-                   <h3 className="text-sm font-black text-slate-900 dark:text-white uppercase tracking-wider mb-2 flex justify-center items-center gap-2">Sering Terlambat <AlertTriangle size={16} className="text-red-500" /></h3>
-                   <p className="text-slate-600 dark:text-slate-400 text-[10px] uppercase mb-4 tracking-widest">Pengembalian Overdue</p>
-                   <div className="bg-slate-50 dark:bg-[#020617] rounded-2xl p-4 border border-slate-200 dark:border-slate-800 text-left">
-                       {leaderboardStats.topLate.length === 0 ? (
-                         <p className="text-slate-500 font-mono text-xs text-center py-4">Belum ada data keterlambatan</p>
-                       ) : (
-                         <ul className="space-y-3">
-                           {leaderboardStats.topLate.map((item, idx) => (
-                             <li key={item.name} className="flex justify-between items-center bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-3 rounded-xl border-l-4 border-l-red-500">
-                               <span className="text-red-700 dark:text-red-500 font-bold text-sm uppercase">{idx + 1}. {item.name}</span>
-                               <span className="text-slate-600 dark:text-slate-400 text-xs font-mono">{item.late}x Telat</span>
-                             </li>
-                           ))}
-                         </ul>
-                       )}
-                   </div>
+                {/* Metric Card 2 */}
+                <div className="bg-white dark:bg-[#1e293b]/55 p-6 rounded-[24px] border border-slate-200 dark:border-slate-800 relative overflow-hidden group">
+                  <span className="absolute top-3 left-3 w-2 h-2 border-t border-l border-emerald-500"></span>
+                  <p className="text-[9px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest">Efisiensi Sistem</p>
+                  <p className="text-4xl font-black text-emerald-500 mt-2 font-mono">99.8%</p>
+                  <p className="text-[10px] text-slate-500 dark:text-slate-400 font-bold mt-1 uppercase">RESPONS MUTASI INSTAN</p>
+                </div>
+                {/* Metric Card 3 */}
+                <div className="bg-white dark:bg-[#1e293b]/55 p-6 rounded-[24px] border border-slate-200 dark:border-slate-800 relative overflow-hidden group">
+                  <span className="absolute top-3 left-3 w-2 h-2 border-t border-l border-purple-500"></span>
+                  <p className="text-[9px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest">Operator Aktif</p>
+                  <p className="text-4xl font-black text-purple-400 mt-2 font-mono">{operatorStats.filter(o => o.total > 0).length}</p>
+                  <p className="text-[10px] text-slate-500 dark:text-slate-400 font-bold mt-1 uppercase">LOGIN VALID</p>
+                </div>
+                {/* Metric Card 4 */}
+                <div className="bg-white dark:bg-[#1e293b]/55 p-6 rounded-[24px] border border-slate-200 dark:border-slate-800 relative overflow-hidden group">
+                  <span className="absolute top-3 left-3 w-2 h-2 border-t border-l border-amber-500"></span>
+                  <p className="text-[9px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest">Elite Guardian</p>
+                  <p className="text-lg font-black text-amber-500 mt-3 uppercase truncate leading-tight">{holderStats[0]?.name || "N/A"}</p>
+                  <p className="text-[10px] text-slate-500 dark:text-slate-400 font-bold mt-2 uppercase">SCORE: {holderStats[0]?.score || 0}</p>
                 </div>
               </div>
 
-              <div className="bg-white dark:bg-[#1e293b] p-8 rounded-[30px] border border-slate-200 dark:border-slate-800 text-center bg-carbon mt-6">
-                 <h3 className="text-xl font-black text-slate-900 dark:text-white uppercase tracking-wider mb-2">Metrik Operator</h3>
-                 <p className="text-slate-600 dark:text-slate-400 text-xs max-w-md mx-auto mb-6">Total transaksi bulan ini berdasarkan operator gudang.</p>
-                 <div className="bg-slate-50 dark:bg-[#020617] rounded-2xl p-6 border border-slate-200 dark:border-slate-800 text-left md:w-2/3 mx-auto">
-                     {leaderboardStats.topOperators.length === 0 ? (
-                       <p className="text-slate-500 font-mono text-xs text-center py-2">Belum ada data transaksi</p>
-                     ) : (
-                       <ul className="space-y-3">
-                         {leaderboardStats.topOperators.map((item, idx) => (
-                           <li key={item.name} className="flex justify-between items-center group">
-                             <p className={`${idx === 0 ? 'text-blue-500' : 'text-slate-600 dark:text-slate-400'} font-black text-sm uppercase tracking-wider flex items-center`}>
-                               {idx + 1}. {item.name}
-                               {idx === 0 && <span className="ml-2 text-[10px] bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-400 px-2 py-0.5 rounded-full inline-flex">TERATAS</span>}
-                             </p>
-                             <span className="text-slate-500 dark:text-slate-500 font-mono text-xs">{item.count} TRX</span>
-                           </li>
-                         ))}
-                       </ul>
-                     )}
-                 </div>
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                
+                {/* Operator Productivity Leaderboard */}
+                <div className="bg-white dark:bg-[#1e293b]/50 backdrop-blur p-6 md:p-8 rounded-[30px] border border-slate-200 dark:border-slate-800 relative overflow-hidden">
+                  <div className="flex justify-between items-center mb-6">
+                    <div>
+                      <h3 className="text-lg font-black text-slate-900 dark:text-white uppercase tracking-wider">Metrik Kecepatan Operator</h3>
+                      <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-1">Dihitung otomatis dari beban log mutasi yang ditangani operator.</p>
+                    </div>
+                  </div>
+
+                  <div className="space-y-5">
+                    {operatorStats.map((op, idx) => {
+                      const maxTotal = operatorStats[0]?.total || 1;
+                      const ratio = Math.round((op.total / maxTotal) * 100);
+                      
+                      return (
+                        <div key={op.name} className="bg-slate-50 dark:bg-[#020617]/50 p-4 rounded-2xl border border-slate-200/60 dark:border-slate-800/80 hover:border-slate-400 transition-colors">
+                          <div className="flex justify-between items-center mb-2.5">
+                            <div className="flex items-center gap-3">
+                              <span className={`w-7 h-7 rounded-lg flex items-center justify-center font-bold text-xs ${idx === 0 ? 'bg-amber-500/20 text-amber-500 border border-amber-500/30' : 'bg-slate-100 dark:bg-slate-800 text-slate-500'}`}>
+                                {idx + 1}
+                              </span>
+                              <span className="text-xs font-black text-slate-900 dark:text-white uppercase tracking-wider">{op.name}</span>
+                            </div>
+                            <div className="text-right">
+                              <span className="text-xs font-black text-slate-900 dark:text-cyan-400 font-mono">{op.total} TRANS</span>
+                            </div>
+                          </div>
+
+                          {/* Horizontal Progress Bar */}
+                          <div className="w-full bg-slate-200 dark:bg-slate-800 h-2 rounded-full overflow-hidden mb-2">
+                            <div 
+                              className={`h-full rounded-full transition-all duration-1000 ${idx === 0 ? 'bg-gradient-to-r from-cyan-500 to-emerald-500' : 'bg-slate-500'}`}
+                              style={{ width: `${Math.max(5, ratio)}%` }}
+                            ></div>
+                          </div>
+
+                          {/* Mutasi Breakdown Segments */}
+                          <div className="flex items-center gap-3 text-[9px] font-mono tracking-wide text-slate-400 uppercase mt-1">
+                            <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span> IN: {op.scansIn}</span>
+                            <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-orange-500"></span> OUT: {op.scansOut}</span>
+                            <span className="flex items-center gap-1"><span className="w-1.5 h-1.5 rounded-full bg-blue-500"></span> ADD: {op.adds}</span>
+                          </div>
+                        </div>
+                      );
+                    })}
+                    {operatorStats.length === 0 && (
+                      <p className="text-center py-8 text-xs text-slate-500 italic uppercase">BELUM ADA DATA OPERASI OPERATOR</p>
+                    )}
+                  </div>
+                </div>
+
+                {/* Peaks of Activity (Siklus Jam Kerja) */}
+                <div className="bg-white dark:bg-[#1e293b]/50 backdrop-blur p-6 md:p-8 rounded-[30px] border border-slate-200 dark:border-slate-800 relative overflow-hidden flex flex-col justify-between">
+                  <div>
+                    <h3 className="text-lg font-black text-slate-900 dark:text-white uppercase tracking-wider mb-1">Puncak Aktivitas Gudang</h3>
+                    <p className="text-[11px] text-slate-500 dark:text-slate-400 mb-6">Analisis waktu operasional penumpukan log checkout dan checkin.</p>
+                  </div>
+
+                  <div className="space-y-6">
+                    {/* Pagi */}
+                    <div>
+                      <div className="flex justify-between items-center text-xs font-black mb-1.5 uppercase font-mono">
+                        <span className="tracking-widest text-slate-900 dark:text-slate-100 flex items-center gap-2">☀️ PAGI (06:00 - 12:00)</span>
+                        <span className="text-cyan-400">{peakHours.pagi} LOGS</span>
+                      </div>
+                      <div className="w-full bg-slate-200 dark:bg-slate-800 h-2.5 rounded-full overflow-hidden">
+                        <div className="h-full bg-cyan-400 rounded-full" style={{ width: `${logs.length > 0 ? (peakHours.pagi / logs.length) * 100 : 0}%` }}></div>
+                      </div>
+                    </div>
+
+                    {/* Siang */}
+                    <div>
+                      <div className="flex justify-between items-center text-xs font-black mb-1.5 uppercase font-mono">
+                        <span className="tracking-widest text-slate-900 dark:text-slate-100 flex items-center gap-2">🔥 SIANG (12:00 - 18:00)</span>
+                        <span className="text-orange-400">{peakHours.siang} LOGS</span>
+                      </div>
+                      <div className="w-full bg-slate-200 dark:bg-slate-800 h-2.5 rounded-full overflow-hidden">
+                        <div className="h-full bg-orange-400 rounded-full" style={{ width: `${logs.length > 0 ? (peakHours.siang / logs.length) * 100 : 0}%` }}></div>
+                      </div>
+                    </div>
+
+                    {/* Sore */}
+                    <div>
+                      <div className="flex justify-between items-center text-xs font-black mb-1.5 uppercase font-mono">
+                        <span className="tracking-widest text-slate-900 dark:text-slate-100 flex items-center gap-2">🌇 SORE (18:00 - 24:00)</span>
+                        <span className="text-emerald-500">{peakHours.sore} LOGS</span>
+                      </div>
+                      <div className="w-full bg-slate-200 dark:bg-slate-800 h-2.5 rounded-full overflow-hidden">
+                        <div className="h-full bg-emerald-500 rounded-full" style={{ width: `${logs.length > 0 ? (peakHours.sore / logs.length) * 100 : 0}%` }}></div>
+                      </div>
+                    </div>
+
+                    {/* Malam */}
+                    <div>
+                      <div className="flex justify-between items-center text-xs font-black mb-1.5 uppercase font-mono">
+                        <span className="tracking-widest text-slate-900 dark:text-slate-100 flex items-center gap-2">🌙 MALAM (00:00 - 06:00)</span>
+                        <span className="text-purple-400">{peakHours.malam} LOGS</span>
+                      </div>
+                      <div className="w-full bg-slate-200 dark:bg-slate-800 h-2.5 rounded-full overflow-hidden">
+                        <div className="h-full bg-purple-400 rounded-full" style={{ width: `${logs.length > 0 ? (peakHours.malam / logs.length) * 100 : 0}%` }}></div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="mt-8 bg-slate-50 dark:bg-[#020617] border border-slate-200 dark:border-slate-800/80 p-4 rounded-xl text-left font-mono text-[9px] leading-relaxed text-slate-500 max-w-sm">
+                    &gt; LOG ANALYSIS SUMMARY: Gudang paling sibuk terjadi pada koridor waktu dengan diagram bar tertinggi. Pastikan ketersediaan personil operator mencukupi.
+                  </div>
+                </div>
+
+                {/* Leaderboard Personil Tergiat & Reward */}
+                <div className="bg-white dark:bg-[#1e293b]/50 backdrop-blur p-6 md:p-8 rounded-[30px] border border-slate-200 dark:border-slate-800 relative overflow-hidden mt-8 lg:col-span-2">
+                  <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-8 gap-4">
+                    <div>
+                      <h3 className="text-xl font-black text-slate-900 dark:text-white uppercase tracking-wider flex items-center gap-3">
+                        <Trophy className="text-amber-500" /> Prestasi Personil Tergiat
+                      </h3>
+                      <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-1 uppercase">Sistem reward otomatis berdasarkan intensitas mutasi & kedisiplinan.</p>
+                    </div>
+                    <div className="bg-emerald-500/10 border border-emerald-500/20 px-4 py-2 rounded-xl">
+                       <span className="text-[10px] font-black text-emerald-500 uppercase tracking-widest">Update Real-time</span>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    {holderStats.map((holder, idx) => {
+                       const getTier = (rank: number) => {
+                         if (rank === 0) return { label: 'ELITE GUARDIAN', color: 'text-amber-500', bg: 'bg-amber-500/10', border: 'border-amber-500/30' };
+                         if (rank < 3) return { label: 'TACTICAL MASTER', color: 'text-slate-300', bg: 'bg-slate-300/10', border: 'border-slate-300/30' };
+                         if (rank < 5) return { label: 'RELIABLE SOLDIER', color: 'text-orange-400', bg: 'bg-orange-400/10', border: 'border-orange-400/30' };
+                         return { label: 'ACTIVE PERSONNEL', color: 'text-slate-500', bg: 'bg-slate-500/5', border: 'border-slate-500/20' };
+                       };
+                       const tier = getTier(idx);
+                       
+                       return (
+                         <div key={holder.name} className="group relative bg-slate-50 dark:bg-[#020617]/40 p-5 rounded-[24px] border border-slate-200/60 dark:border-slate-800/80 hover:scale-[1.02] transition-all">
+                            <div className="flex justify-between items-start mb-4">
+                               <div className="flex items-center gap-4">
+                                  <div className={`w-12 h-12 rounded-2xl ${tier.bg} ${tier.border} border flex items-center justify-center font-black text-xl ${tier.color} shadow-lg shadow-black/20`}>
+                                     {idx + 1}
+                                  </div>
+                                  <div>
+                                     <p className="text-xs font-black text-slate-900 dark:text-white uppercase tracking-wider mb-1 line-clamp-1">{holder.name}</p>
+                                     <div className={`inline-flex items-center px-2 py-0.5 rounded-full text-[8px] font-black uppercase tracking-[0.1em] ${tier.bg} ${tier.color} ${tier.border} border`}>
+                                        {tier.label}
+                                     </div>
+                                  </div>
+                               </div>
+                               <div className="text-right">
+                                  <p className="text-[9px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest mb-1">Impact Score</p>
+                                  <p className="text-lg font-black text-slate-900 dark:text-white font-mono">{holder.score}</p>
+                               </div>
+                            </div>
+                            
+                            <div className="grid grid-cols-3 gap-3">
+                               <div className="bg-white dark:bg-white/5 p-2 rounded-xl text-center">
+                                  <p className="text-[7px] font-black text-slate-400 uppercase mb-0.5">Total</p>
+                                  <p className="text-[10px] font-bold text-slate-900 dark:text-white">{holder.total}</p>
+                               </div>
+                               <div className="bg-white dark:bg-white/5 p-2 rounded-xl text-center border-x border-slate-100 dark:border-white/5">
+                                  <p className="text-[7px] font-black text-slate-400 uppercase mb-0.5">Hari</p>
+                                  <p className="text-[10px] font-bold text-slate-900 dark:text-white">{holder.uniqueDays}</p>
+                               </div>
+                               <div className="bg-white dark:bg-white/5 p-2 rounded-xl text-center">
+                                  <p className="text-[7px] font-black text-slate-400 uppercase mb-0.5">In/Out</p>
+                                  <p className="text-[10px] font-bold text-emerald-500">{holder.scansIn}/{holder.scansOut}</p>
+                               </div>
+                            </div>
+                            
+                            {/* Achievement Bar */}
+                             <div className="mt-4 w-full bg-slate-100 dark:bg-slate-900 h-1.5 rounded-full overflow-hidden">
+                                <div 
+                                  className={`h-full rounded-full ${idx === 0 ? 'bg-amber-500' : 'bg-slate-400 dark:bg-slate-700'}`} 
+                                  style={{ width: `${Math.min(100, (holder.score / (holderStats[0]?.score || 1)) * 100)}%` }}
+                                ></div>
+                             </div>
+                         </div>
+                       );
+                    })}
+                  </div>
+                  
+                  <div className="mt-8 grid grid-cols-1 md:grid-cols-3 gap-4 border-t border-slate-200 dark:border-slate-800 pt-8">
+                     <div className="flex gap-3 items-center">
+                        <div className="w-8 h-8 rounded-full bg-amber-500/10 border border-amber-500/30 flex items-center justify-center text-amber-500"><Medal size={16} /></div>
+                        <p className="text-[9px] leading-tight text-slate-500 dark:text-slate-400 uppercase font-bold"><span className="text-slate-900 dark:text-white">Gold Reward:</span> Sertifikat Penghargaan & Prioritas Pinjam Lanjut.</p>
+                     </div>
+                     <div className="flex gap-3 items-center">
+                        <div className="w-8 h-8 rounded-full bg-slate-300/10 border border-slate-300/30 flex items-center justify-center text-slate-300"><Medal size={16} /></div>
+                        <p className="text-[9px] leading-tight text-slate-500 dark:text-slate-400 uppercase font-bold"><span className="text-slate-900 dark:text-white">Silver Reward:</span> Akses Area Terbatas & Badge Personil Unggul.</p>
+                     </div>
+                     <div className="flex gap-3 items-center">
+                        <div className="w-8 h-8 rounded-full bg-orange-400/10 border border-orange-400/30 flex items-center justify-center text-orange-400"><Medal size={16} /></div>
+                        <p className="text-[9px] leading-tight text-slate-500 dark:text-slate-400 uppercase font-bold"><span className="text-slate-900 dark:text-white">Bronze Reward:</span> Rekomendasi Kinerja Bulanan Otomatis.</p>
+                     </div>
+                  </div>
+                </div>
+
               </div>
           </div>
         )}
@@ -2333,9 +2592,6 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                   </div>
               </div>
           </div>
-        )}
-        {activeTab === 'print-labels' && (
-          <PrintLabels inventory={inventory} />
         )}
         {activeTab === 'profile' && (
           <div className="max-w-3xl mx-auto py-10 animate-in fade-in">
@@ -2523,6 +2779,10 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                     </div>
                     <h2 className="text-2xl font-black text-slate-900 dark:text-white uppercase tracking-wider">{viewingItem.name}</h2>
                     <p className="text-blue-500 font-mono text-sm mt-1">{viewingItem.id}</p>
+                    <div className="mt-4 bg-white p-2 w-fit rounded-xl border border-blue-500/30 shadow-[0_0_15px_rgba(59,130,246,0.2)]">
+                      <QRCodeSVG value={viewingItem.id} size={80} level="H" includeMargin={false} />
+                      <p className="text-[8px] font-black text-center text-slate-900 mt-1 uppercase font-mono">SCAN INFO</p>
+                    </div>
                  </div>
                  <div className="p-4 sm:p-8 space-y-4 overflow-y-auto scrollbar-thin scrollbar-thumb-blue-900/50 scrollbar-track-transparent">
                     <div className="grid grid-cols-2 gap-4">
@@ -2742,7 +3002,57 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
           )}
         </AnimatePresence>
 
-        <JarvisAssistant logs={logs} inventory={inventory} isOnline={isOnline} currentUser={currentUser} />
+        {/* Animated Custom In-App Overdue Push Notifications HUD */}
+        <div className="fixed top-20 right-6 z-[9999] p-4 flex flex-col gap-3 pointer-events-none max-w-sm w-full">
+          <AnimatePresence>
+            {overdueNotifications.map((item) => (
+              <motion.div
+                key={item.id}
+                initial={{ opacity: 0, x: 150, y: -20, scale: 0.9 }}
+                animate={{ opacity: 1, x: 0, y: 0, scale: 1 }}
+                exit={{ opacity: 0, x: 150, scale: 0.9 }}
+                transition={{ type: "spring", stiffness: 350, damping: 25 }}
+                className="bg-red-950/95 border border-red-500/50 backdrop-blur-md rounded-2xl p-4 shadow-[0_4px_25px_rgba(239,68,68,0.25)] ring-1 ring-red-500/20 pointer-events-auto overflow-hidden relative"
+              >
+                {/* Visual Alarm light effect */}
+                <div className="absolute inset-x-0 top-0 h-[2px] bg-gradient-to-r from-transparent via-red-500 to-transparent animate-pulse"></div>
+                <div className="flex gap-3">
+                  <div className="flex-shrink-0 w-10 h-10 rounded-xl bg-red-900/30 border border-red-500/30 flex items-center justify-center text-red-400 animate-pulse">
+                    <AlertTriangle size={18} className="animate-bounce" />
+                  </div>
+                  <div className="flex-1 text-left">
+                    <div className="flex justify-between items-start">
+                      <span className="text-[9px] font-black tracking-widest text-red-400 uppercase font-mono">PUSH ALERT: KETERLAMBATAN</span>
+                      <button 
+                        onClick={() => setClosedPushNotifs(prev => [...prev, item.id])}
+                        className="text-red-400 hover:text-white hover:bg-red-900/40 p-1 rounded-md transition-colors"
+                        title="Tutup Notifikasi"
+                      >
+                        <X size={12} />
+                      </button>
+                    </div>
+                    <p className="text-xs font-black text-white uppercase mt-1.5">{item.name}</p>
+                    <p className="text-[10px] font-mono font-medium text-red-300 mt-0.5">PEMEGANG: <span className="font-bold">{item.holder || "UNKNOWN"}</span></p>
+                    <p className="text-[9px] font-mono text-slate-400 mt-2">Batas waktu terlampaui. Segera lakukan penindakan pengembalian.</p>
+                  </div>
+                </div>
+              </motion.div>
+            ))}
+          </AnimatePresence>
+        </div>
+
+        {/* J.A.R.V.I.S Assistant Element */}
+        <JarvisAssistant 
+          logs={logs} 
+          inventory={inventory} 
+          isOnline={isOnline} 
+          currentUser={currentUser} 
+        />
+
+        {/* Hidden Global Inputs */}
+        <input type="file" ref={excelInputRef} onChange={handleImportExcel} accept=".xlsx, .xls" className="hidden" />
+        <input type="file" ref={fileInputRef} onChange={handleRestoreDB} accept=".json" className="hidden" />
+
       </main>
     </div>
     </div>

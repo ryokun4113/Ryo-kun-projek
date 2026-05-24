@@ -60,7 +60,10 @@ export const AuthScreen = ({
         }
      };
 
-     const matchedUser = users.find(u => u.username.toUpperCase() === loginId.toUpperCase() && u.password === loginCode);
+      const matchedUser = users.find(u => {
+        const uname = (u?.username || "").toString().toUpperCase();
+        return uname === loginId.toUpperCase() && u.password === loginCode;
+      });
      
      if (matchedUser) {
         if ('Notification' in window && Notification.permission !== 'granted' && Notification.permission !== 'denied') {
@@ -72,7 +75,7 @@ export const AuthScreen = ({
      } else {
         playSound('error');
         if ('Notification' in window && Notification.permission === 'granted') {
-            new Notification('Sistem Gudang: Peringatan Akses', { body: `Akses login yang tidak dikenal terdeteksi (ID: ${loginId}).`, icon: '/vite.svg' });
+            new Notification('Sistem Manajemen Gudang Senjata: Peringatan Akses', { body: `Akses login yang tidak dikenal terdeteksi (ID: ${loginId}).`, icon: '/vite.svg' });
         }
         setTimeout(() => {
            alert("Akses Ditolak. Kredensial tidak valid.");

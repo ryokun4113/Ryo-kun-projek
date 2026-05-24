@@ -8,13 +8,16 @@ export function MetricsWidget({ inventory, dashboardListType, setDashboardListTy
             <div className={`relative w-full transition-all ${dashboardListType === 'Total' ? 'z-50' : 'z-10 hover:z-40'}`}>
                 <div 
                     onClick={() => setDashboardListType(dashboardListType === 'Total' ? null : 'Total')}
-                    className="bg-white/80 dark:bg-[#1e293b]/50 backdrop-blur p-8 rounded-[40px] border border-slate-200 dark:border-slate-700 hover:border-slate-500 transition-colors shadow-[0_8px_30px_rgba(0,0,0,0.04)] dark:shadow-[0_8px_30px_rgba(0,0,0,0.04)] dark:shadow-2xl relative overflow-hidden group cursor-pointer h-full"
+                    className="bg-white/80 dark:bg-slate-900/40 backdrop-blur-xl p-8 rounded-[40px] border border-slate-200 dark:border-white/10 hover:border-slate-400 dark:hover:border-white/30 transition-all duration-300 shadow-xl dark:shadow-[0_0_20px_rgba(0,0,0,0.2)] relative overflow-hidden group cursor-pointer h-full"
                 >
-                <span className="absolute top-4 left-4 w-3 h-3 border-t border-l border-slate-600"></span>
-                <span className="absolute bottom-4 right-4 w-3 h-3 border-b border-r border-slate-600"></span>
-                <div className="absolute inset-0 bg-gradient-to-br from-blue-500/5 to-transparent opacity-0 group-hover:opacity-100 transition-opacity"></div>
-                <p className="text-[10px] font-black text-slate-600 dark:text-slate-400 uppercase tracking-widest">Total Aset<br/>Terdaftar</p>
-                <p className="text-6xl font-black text-slate-900 dark:text-white mt-4">{inventory.length}</p>
+                <div className="absolute top-0 left-0 w-1 h-32 bg-slate-400/20"></div>
+                <p className="text-[10px] font-black text-slate-500 dark:text-slate-400 uppercase tracking-[0.2em] mb-2 flex items-center gap-2">
+                    <span className="w-1.5 h-1.5 rounded-full bg-slate-400"></span> TOTAL ASET
+                </p>
+                <p className="text-6xl font-black text-slate-900 dark:text-white mt-1 tracking-tighter">{inventory.length}</p>
+                <div className="mt-4 flex items-center gap-2">
+                    <span className="text-[9px] font-bold text-slate-400 uppercase tracking-widest border border-slate-200 dark:border-white/10 px-2 py-0.5 rounded-full">Global Database</span>
+                </div>
                 </div>
                 {dashboardListType === 'Total' && (
                     <div className="absolute top-full left-0 right-0 mt-4 bg-slate-50 dark:bg-[#020617] border border-slate-300 dark:border-slate-700 rounded-[30px] p-6 shadow-2xl shadow-black/80 max-h-[300px] overflow-y-auto z-50 animate-in slide-in-from-top-4">
@@ -42,13 +45,16 @@ export function MetricsWidget({ inventory, dashboardListType, setDashboardListTy
             <div className={`relative w-full transition-all ${dashboardListType === 'Tersedia' ? 'z-50' : 'z-10 hover:z-40'}`}>
                 <div 
                     onClick={() => setDashboardListType(dashboardListType === 'Tersedia' ? null : 'Tersedia')}
-                    className="bg-white/80 dark:bg-[#1e293b]/50 backdrop-blur p-8 rounded-[40px] border border-slate-200 dark:border-slate-700 hover:border-emerald-500/50 transition-colors shadow-[0_8px_30px_rgba(0,0,0,0.04)] dark:shadow-[0_8px_30px_rgba(0,0,0,0.04)] dark:shadow-2xl relative overflow-hidden group cursor-pointer h-full"
+                    className="bg-white/80 dark:bg-slate-900/40 backdrop-blur-xl p-8 rounded-[40px] border border-slate-200 dark:border-emerald-500/10 hover:border-emerald-500/50 transition-all duration-300 shadow-xl dark:shadow-[0_0_20px_rgba(16,185,129,0.05)] relative overflow-hidden group cursor-pointer h-full"
                 >
-                <span className="absolute top-4 left-4 w-3 h-3 border-t border-l border-emerald-600"></span>
-                <span className="absolute bottom-4 right-4 w-3 h-3 border-b border-r border-emerald-600"></span>
-                <div className="absolute inset-0 bg-gradient-to-br from-emerald-500/5 to-transparent opacity-0 group-hover:opacity-100 transition-opacity"></div>
-                <p className="text-[10px] font-black text-slate-600 dark:text-slate-400 uppercase tracking-widest">Aset Tersedia<br/>(Di Gudang)</p>
-                <p className="text-6xl font-black text-emerald-500 mt-4 drop-shadow-[0_0_15px_rgba(16,185,129,0.5)]">{inventory.filter((i: any) => i.status === "Di Gudang").length}</p>
+                <div className="absolute top-0 left-0 w-1 h-32 bg-emerald-500/20"></div>
+                <p className="text-[10px] font-black text-emerald-600 dark:text-emerald-500/80 uppercase tracking-[0.2em] mb-2 flex items-center gap-2">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)]"></span> TERSEDIA
+                </p>
+                <p className="text-6xl font-black text-emerald-500 mt-1 tracking-tighter drop-shadow-[0_0_15px_rgba(16,185,129,0.3)]">{inventory.filter((i: any) => i.status === "Di Gudang").length}</p>
+                <div className="mt-4 flex items-center gap-2">
+                    <span className="text-[9px] font-bold text-emerald-600 dark:text-emerald-500 uppercase tracking-widest border border-emerald-500/20 px-2 py-0.5 rounded-full bg-emerald-500/5">In Warehouse</span>
+                </div>
                 </div>
                 {dashboardListType === 'Tersedia' && (
                     <div className="absolute top-full left-0 right-0 mt-4 bg-slate-50 dark:bg-[#020617] border border-emerald-900/50 rounded-[30px] p-6 shadow-2xl shadow-emerald-900/20 max-h-[300px] overflow-y-auto z-50 animate-in slide-in-from-top-4">
@@ -76,13 +82,16 @@ export function MetricsWidget({ inventory, dashboardListType, setDashboardListTy
             <div className={`relative w-full transition-all ${dashboardListType === 'Keluar' ? 'z-50' : 'z-10 hover:z-40'}`}>
                 <div 
                     onClick={() => setDashboardListType(dashboardListType === 'Keluar' ? null : 'Keluar')}
-                    className="bg-white/80 dark:bg-[#1e293b]/50 backdrop-blur p-8 rounded-[40px] border border-slate-200 dark:border-slate-700 hover:border-orange-500/50 transition-colors shadow-[0_8px_30px_rgba(0,0,0,0.04)] dark:shadow-[0_8px_30px_rgba(0,0,0,0.04)] dark:shadow-2xl relative overflow-hidden group cursor-pointer h-full"
+                    className="bg-white/80 dark:bg-slate-900/40 backdrop-blur-xl p-8 rounded-[40px] border border-slate-200 dark:border-orange-500/10 hover:border-orange-500/50 transition-all duration-300 shadow-xl dark:shadow-[0_0_20px_rgba(249,115,22,0.05)] relative overflow-hidden group cursor-pointer h-full"
                 >
-                <span className="absolute top-4 left-4 w-3 h-3 border-t border-l border-orange-600"></span>
-                <span className="absolute bottom-4 right-4 w-3 h-3 border-b border-r border-orange-600"></span>
-                <div className="absolute inset-0 bg-gradient-to-br from-orange-500/5 to-transparent opacity-0 group-hover:opacity-100 transition-opacity"></div>
-                <p className="text-[10px] font-black text-slate-600 dark:text-slate-400 uppercase tracking-widest">Aset Dipinjamkan<br/>(Keluar)</p>
-                <p className="text-6xl font-black text-orange-400 mt-4 drop-shadow-[0_0_15px_rgba(249,115,22,0.5)]">{inventory.filter((i: any) => i.status === "Keluar").length}</p>
+                <div className="absolute top-0 left-0 w-1 h-32 bg-orange-500/20"></div>
+                <p className="text-[10px] font-black text-orange-600 dark:text-orange-500/80 uppercase tracking-[0.2em] mb-2 flex items-center gap-2">
+                    <span className="w-1.5 h-1.5 rounded-full bg-orange-500 shadow-[0_0_8px_rgba(249,115,22,0.5)]"></span> KELUAR
+                </p>
+                <p className="text-6xl font-black text-orange-400 mt-1 tracking-tighter drop-shadow-[0_0_15px_rgba(249,115,22,0.3)]">{inventory.filter((i: any) => i.status === "Keluar").length}</p>
+                <div className="mt-4 flex items-center gap-2">
+                    <span className="text-[9px] font-bold text-orange-600 dark:text-orange-500 uppercase tracking-widest border border-orange-500/20 px-2 py-0.5 rounded-full bg-orange-500/5">Borrowed Items</span>
+                </div>
                 </div>
                 {dashboardListType === 'Keluar' && (
                     <div className="absolute top-full left-0 right-0 mt-4 bg-slate-50 dark:bg-[#020617] border border-orange-900/50 rounded-[30px] p-6 shadow-2xl shadow-orange-900/20 max-h-[300px] overflow-y-auto z-50 animate-in slide-in-from-top-4">
