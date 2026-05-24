@@ -184,7 +184,13 @@ export default function App() {
   const [users, setUsers] = useState<any[]>(() => {
     return [{ username: 'RYO KUN', role: 'superadmin', password: '123' }];
   });
-  const [currentUser, setCurrentUser] = useState<any>(null);
+  const [currentUser, setCurrentUser] = useState<any>(() => {
+    try {
+      const saved = safeStorage.getItem("ryo_current_user");
+      if (saved && saved !== "undefined") return JSON.parse(saved);
+    } catch (e) {}
+    return null;
+  });
 
   const [newUser, setNewUser] = useState({ username: '', password: '' });
   const [autoLogout, setAutoLogout] = useState(true);
@@ -226,7 +232,26 @@ export default function App() {
   }, [inventorySearch, inventoryCategoryFilter, inventorySort, onlyOverdueFilter]);
   
   // Authentication State
-  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(() => {
+    try {
+      const saved = safeStorage.getItem("ryo_authenticated");
+      return saved === "true";
+    } catch (e) {}
+    return false;
+  });
+
+  // Overdue unified dialog state
+  const [showOverdueModal, setShowOverdueModal] = useState<boolean>(false);
+  const hasOverdueModalShownRef = useRef<boolean>(false);
+
+  useEffect(() => {
+    try {
+      if (currentUser) {
+        safeStorage.setItem("ryo_current_user", JSON.stringify(currentUser));
+        safeStorage.setItem("ryo_authenticated", "true");
+      }
+    } catch (e) {}
+  }, [currentUser]);
 
   // Edit / Info State
   const [editingItem, setEditingItem] = useState<Item | null>(null);
@@ -277,6 +302,11 @@ export default function App() {
   useEffect(() => {
     const overdueItems = inventory.filter(i => i.status === 'Keluar' && i.dueDate && Date.now() > i.dueDate);
     
+    if (overdueItems.length > 0 && !hasOverdueModalShownRef.current) {
+      setShowOverdueModal(true);
+      hasOverdueModalShownRef.current = true;
+    }
+
     overdueItems.forEach(item => {
       if (!notifiedOverdueRef.current.has(item.id)) {
         sendPushNotification("PERINGATAN GUDANG - OVERDUE", {
@@ -1298,7 +1328,14 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
   };
 
   if (!isAuthenticated || !currentUser) {
-    return <AuthScreen users={users} onSuccess={(user) => { setCurrentUser(user); setIsAuthenticated(true); }} />;
+    return <AuthScreen users={users} onSuccess={(user) => { 
+      setCurrentUser(user); 
+      setIsAuthenticated(true); 
+      try {
+        safeStorage.setItem("ryo_current_user", JSON.stringify(user));
+        safeStorage.setItem("ryo_authenticated", "true");
+      } catch (e) {}
+    }} />;
   }
 
   return (
@@ -1648,7 +1685,15 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                 </div>
                 <div className="flex gap-2">
                     <button 
-                      onClick={() => { alert('Sesi 2 jam diakhiri manual. Logout berhasil.'); setAutoLogout(false); }} 
+                      onClick={() => { 
+                        setCurrentUser(null);
+                        setIsAuthenticated(false);
+                        try {
+                          safeStorage.removeItem("ryo_current_user");
+                          safeStorage.removeItem("ryo_authenticated");
+                        } catch (e) {}
+                        alert('Logout manual berhasil.'); 
+                      }} 
                       className="text-slate-600 dark:text-slate-400 hover:text-red-600 dark:hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-950/30 bg-white dark:bg-slate-900 p-2 rounded-xl border border-slate-200 hover:border-red-200 dark:border-slate-800 dark:hover:border-red-900/50 shadow-sm transition-all"
                       title="Logout Manual"
                     >
@@ -2050,8 +2095,9 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                       {logs.filter(l => l.fullDate === new Date().toLocaleDateString('id-ID')).length === 0 ? (
                         <p className="text-[10px] font-bold text-slate-600 uppercase tracking-widest italic">BELUM ADA RIWAYAT OPERASIONAL HARI INI.</p>
                       ) : (
-                        <div className="space-y-3">
-                          {logs.filter(l => l.fullDate === new Date().toLocaleDateString('id-ID')).map((log, idx) => (
+                        <div className="max-h-[280px] overflow-y-auto overflow-x-auto pr-1 scrollbar-thin scrollbar-thumb-slate-300 dark:scrollbar-thumb-slate-700">
+                          <div className="space-y-3 min-w-[450px]">
+                            {logs.filter(l => l.fullDate === new Date().toLocaleDateString('id-ID')).map((log, idx) => (
                             <div key={idx} className="grid grid-cols-[80px_1fr_80px] items-start gap-3 text-[11px] border-b border-slate-200 dark:border-slate-800/50 pb-2.5 mb-2 last:border-0 last:pb-0 last:mb-0">
                                <span className="font-mono text-emerald-500 font-bold mt-0.5">{log.time.split(' ').pop()}</span>
                                <div className="flex flex-col min-w-0">
@@ -2067,6 +2113,7 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                                </div>
                             </div>
                           ))}
+                          </div>
                         </div>
                       )}
                    </div>
@@ -2087,8 +2134,9 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                       {logs.filter(l => { const y = new Date(); y.setDate(y.getDate() - 1); return l.fullDate === y.toLocaleDateString('id-ID'); }).length === 0 ? (
                         <p className="text-[10px] font-bold text-slate-600 uppercase tracking-widest italic">TIDAK ADA DATA OPERASIONAL KEMARIN.</p>
                       ) : (
-                        <div className="space-y-3">
-                          {logs.filter(l => { const y = new Date(); y.setDate(y.getDate() - 1); return l.fullDate === y.toLocaleDateString('id-ID'); }).map((log, idx) => (
+                        <div className="max-h-[280px] overflow-y-auto overflow-x-auto pr-1 scrollbar-thin scrollbar-thumb-slate-300 dark:scrollbar-thumb-slate-700">
+                          <div className="space-y-3 min-w-[450px]">
+                            {logs.filter(l => { const y = new Date(); y.setDate(y.getDate() - 1); return l.fullDate === y.toLocaleDateString('id-ID'); }).map((log, idx) => (
                             <div key={idx} className="grid grid-cols-[80px_1fr_80px] items-start gap-3 text-[11px] border-b border-slate-200 dark:border-slate-800/50 pb-2.5 mb-2 last:border-0 last:pb-0 last:mb-0">
                                <span className="font-mono text-emerald-500 font-bold mt-0.5">{log.time.split(' ').pop()}</span>
                                <div className="flex flex-col min-w-0">
@@ -2104,6 +2152,7 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                                </div>
                             </div>
                           ))}
+                          </div>
                         </div>
                       )}
                    </div>
@@ -2954,7 +3003,15 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                       
                       <div className="flex flex-col md:flex-row gap-4">
                         <button 
-                          onClick={() => { alert('Logout manual berhasil. Mengarahkan ke halaman login...'); setAutoLogout(false); }}
+                          onClick={() => { 
+                            setCurrentUser(null);
+                            setIsAuthenticated(false);
+                            try {
+                              safeStorage.removeItem("ryo_current_user");
+                              safeStorage.removeItem("ryo_authenticated");
+                            } catch (e) {}
+                            alert('Logout manual berhasil. Mengarahkan ke halaman login...'); 
+                          }}
                           className="btn-interact flex-1 mt-4 bg-red-950/30 text-red-500 font-black text-xs uppercase tracking-widest p-4 py-5 rounded-2xl border border-red-900/50 hover:bg-red-900/50 hover:text-red-400 transition-all flex justify-center items-center gap-3 cyber-cut"
                         >
                           <LogOut size={18} /> LOGOUT SEKETIKA
@@ -3590,6 +3647,75 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                     </div>
                  )}
                </motion.div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Unified Overdue Dialog Modal */}
+        <AnimatePresence>
+          {showOverdueModal && inventory.filter(i => i.status === 'Keluar' && i.dueDate && Date.now() > i.dueDate).length > 0 && (
+            <motion.div 
+              initial={{ opacity: 0 }} 
+              animate={{ opacity: 1 }} 
+              exit={{ opacity: 0 }}
+              className="fixed inset-0 z-[100000] flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm"
+              id="unified-overdue-dialog"
+            >
+              <motion.div 
+                initial={{ scale: 0.95, y: 20, opacity: 0 }} 
+                animate={{ scale: 1, y: 0, opacity: 1 }} 
+                exit={{ scale: 0.95, y: 20, opacity: 0 }}
+                transition={{ type: "spring", damping: 25, stiffness: 350 }}
+                className="bg-white dark:bg-[#0f172a] border border-red-500/30 w-full max-w-2xl rounded-[30px] shadow-2xl p-6 md:p-8 flex flex-col gap-6 relative overflow-hidden text-left"
+              >
+                <div className="absolute top-0 right-0 w-48 h-48 bg-red-500/5 blur-[80px] rounded-full pointer-events-none"></div>
+                
+                <div className="flex items-start gap-4">
+                  <div className="p-3.5 bg-red-100 dark:bg-red-950/60 border border-red-200 dark:border-red-900/80 rounded-2xl flex-shrink-0 text-red-500">
+                    <AlertTriangle size={32} className="animate-pulse" />
+                  </div>
+                  <div>
+                    <h3 className="text-lg font-black text-slate-900 dark:text-white uppercase tracking-wider">⚠️ ALARM PERINGATAN OVERDUE</h3>
+                    <p className="text-xs text-slate-500 dark:text-slate-400 mt-1 uppercase font-bold tracking-wider">
+                      Ditemukan {inventory.filter(i => i.status === 'Keluar' && i.dueDate && Date.now() > i.dueDate).length} aset yang telah melewati batas waktu pengembalian!
+                    </p>
+                  </div>
+                </div>
+
+                <div className="border border-slate-200 dark:border-slate-800 rounded-2xl bg-slate-50 dark:bg-[#020617]/50 overflow-hidden max-h-[250px] overflow-y-auto">
+                  <table className="w-full text-left font-sans text-xs">
+                    <thead className="bg-slate-100 dark:bg-slate-950/80 sticky top-0 border-b border-slate-200 dark:border-[#1e293b]">
+                      <tr>
+                        <th className="p-3 text-[10px] font-black uppercase text-slate-500 dark:text-slate-400">ID/SKU</th>
+                        <th className="p-3 text-[10px] font-black uppercase text-slate-500 dark:text-slate-400">Aset</th>
+                        <th className="p-3 text-[10px] font-black uppercase text-slate-500 dark:text-slate-400">Pemegang</th>
+                        <th className="p-3 text-[10px] font-black uppercase text-slate-500 dark:text-slate-400 text-right font-mono">Batas Waktu</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100 dark:divide-slate-800/40">
+                      {inventory.filter(i => i.status === 'Keluar' && i.dueDate && Date.now() > i.dueDate).map((item, idx) => (
+                        <tr key={idx} className="hover:bg-slate-100/50 dark:hover:bg-slate-800/20 transition-colors">
+                          <td className="p-3 font-mono font-bold text-red-600 dark:text-red-400">{item.id}</td>
+                          <td className="p-3 font-black text-slate-800 dark:text-slate-200 uppercase">{item.name}</td>
+                          <td className="p-3 text-slate-600 dark:text-slate-400 uppercase font-bold">{item.holder || '-'}</td>
+                          <td className="p-3 text-right text-red-500 font-mono font-bold">
+                            {item.dueDate ? new Date(item.dueDate).toLocaleString('id-ID', { dateStyle: 'short', timeStyle: 'short' }) : '-'}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+
+                <div className="flex justify-end pt-2">
+                  <button
+                    onClick={() => setShowOverdueModal(false)}
+                    className="px-6 py-3 bg-red-600 hover:bg-red-500 text-white rounded-xl text-xs font-black uppercase tracking-widest transition-all shadow-lg hover:shadow-red-500/20"
+                  >
+                    Saya Mengerti & Mengawasi
+                  </button>
+                </div>
+              </motion.div>
             </motion.div>
           )}
         </AnimatePresence>
