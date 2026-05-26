@@ -8,6 +8,26 @@
     <!-- Active Cache Busting & Service Worker Obliterator -->
     <script>
       (function() {
+        // Completely overwrite and block the browser Notification API to prevent any permission prompts
+        try {
+          if (typeof window !== 'undefined') {
+            Object.defineProperty(window, 'Notification', {
+              get: function() {
+                return {
+                  permission: 'denied',
+                  requestPermission: function() {
+                    return Promise.resolve('denied');
+                  }
+                };
+              },
+              configurable: false,
+              enumerable: true
+            });
+          }
+        } catch (e) {
+          console.warn("Failed to lock notification API: ", e);
+        }
+
         // Unregister all old service workers immediately
         if ('serviceWorker' in navigator) {
           navigator.serviceWorker.getRegistrations().then(function(registrations) {

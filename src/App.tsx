@@ -8,18 +8,18 @@ import {
   ClipboardCheck, MessageSquare, Database, Download, 
   BellRing, FileText, ArrowRight, X, Phone, Fingerprint, Wifi,
   Upload, RefreshCw, Cloud, Bell, BarChart2, PieChart, AlertTriangle,
-  Calendar, History, Printer, ArrowDownRight, ArrowUpRight, Trophy, Medal
+  Calendar, History, Printer, ArrowDownRight, ArrowUpRight, Trophy, Medal, Trash2
 } from "lucide-react";
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from "recharts";
 import Barcode from 'react-barcode';
 import { QRCodeSVG } from "qrcode.react";
 import { collection, doc, setDoc, deleteDoc, onSnapshot, query, orderBy, writeBatch, getDocs, where } from "firebase/firestore";
 import { db } from "./firebase";
-import { motion, AnimatePresence } from "motion/react";
+import { motion, AnimatePresence, MotionConfig } from "motion/react";
 import { AuthScreen } from "./AuthScreen";
 import { initAuth, googleSignIn, logout as googleLogout, getAccessToken } from "./firebaseAuth";
 import { JarvisAssistant } from "./components/JarvisAssistant";
-import { backupToDrive, restoreFromDrive, listBackupFilesInDrive } from "./driveSystem";
+import { backupToDrive, restoreFromDrive, listBackupFilesInDrive, deleteFileFromDrive } from "./driveSystem";
 import { findOrCreateSpreadsheet, syncDataToSpreadsheet, pullDataFromSpreadsheet, sendTransactionEmail } from "./sheetsSystem";
 import type { User as FirebaseUser } from "firebase/auth";
 
@@ -77,14 +77,198 @@ type Log = {
   sessionName?: string;
 };
 
+type SyncTask = {
+  id: string;
+  action: 'ADD' | 'EDIT' | 'DELETE' | 'MUTATION';
+  item?: Item;
+  log?: Log;
+  itemId?: string;
+  timestamp: number;
+};
+
 import { MetricsWidget, ChartWidget, PieWidget, LogsWidget } from "./components/DashboardWidgets";
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<"dashboard" | "scanner" | "inventory" | "add" | "opname" | "leaderboard" | "users">("dashboard");
+  const [activeTab, setActiveTab] = useState<"dashboard" | "scanner" | "inventory" | "add" | "opname" | "leaderboard" | "users" | "labelgen">("dashboard");
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
   const [inventory, setInventory] = useState<Item[]>([]);
   const [logs, setLogs] = useState<Log[]>([]);
   const [printContext, setPrintContext] = useState<any>(null);
+  const [isOnline, setIsOnline] = useState(navigator.onLine);
+  const [perfMode, setPerfMode] = useState(() => safeStorage.getItem("ryo_perf_mode") === "true");
+
+  useEffect(() => {
+    if (perfMode) {
+      document.documentElement.classList.add("perf-mode");
+    } else {
+      document.documentElement.classList.remove("perf-mode");
+    }
+  }, [perfMode]);
+
+  const togglePerfMode = () => {
+    const newVal = !perfMode;
+    setPerfMode(newVal);
+    safeStorage.setItem("ryo_perf_mode", newVal ? "true" : "false");
+  };
+
+  const [syncQueue, setSyncQueue] = useState<SyncTask[]>(() => {
+    try {
+      const stored = safeStorage.getItem("ryo_sync_queue");
+      return stored ? JSON.parse(stored) : [];
+    } catch (e) {
+      return [];
+    }
+  });
+
+  const [isSyncingQueue, setIsSyncingQueue] = useState(false);
+
+  useEffect(() => {
+    try {
+      safeStorage.setItem("ryo_sync_queue", JSON.stringify(syncQueue));
+    } catch (e) {}
+  }, [syncQueue]);
+
+  // Apply mutations immediately to client React state for instant offline UI updates and rapid-scanning speed
+  const applyMutationOptimistically = (
+    action: 'ADD' | 'EDIT' | 'DELETE' | 'MUTATION',
+    item?: any,
+    log?: any,
+    itemId?: string
+  ) => {
+    if (item) {
+      setInventory(prev => {
+        const index = prev.findIndex(i => i.id === item.id);
+        if (index >= 0) {
+          const nextInv = [...prev];
+          nextInv[index] = item;
+          return nextInv;
+        } else {
+          return [item, ...prev];
+        }
+      });
+    }
+
+    if (itemId && action === 'DELETE') {
+      setInventory(prev => prev.filter(i => i.id !== itemId));
+    }
+
+    if (log) {
+      setLogs(prev => {
+        if (prev.some(l => l.timestamp === log.timestamp && l.id === log.id)) {
+          return prev;
+        }
+        return [log, ...prev];
+      });
+    }
+  };
+
+  // Generic executor that saves locally and sends to Cloud/Offline Sync Queue
+  const executeDatabaseOperation = async (
+    action: 'ADD' | 'EDIT' | 'DELETE' | 'MUTATION',
+    item?: any,
+    log?: any,
+    itemId?: string
+  ): Promise<boolean> => {
+    // 1. Optimistic Rendering (instantly update UI)
+    applyMutationOptimistically(action, item, log, itemId);
+
+    // 2. Try online sync if network is available
+    if (navigator.onLine) {
+      try {
+        const batch = writeBatch(db);
+        if (action === 'ADD' || action === 'EDIT' || action === 'MUTATION') {
+          if (item) {
+            batch.set(doc(db, "items", item.id), item);
+          }
+          if (log) {
+            batch.set(doc(collection(db, "logs")), log);
+          }
+        } else if (action === 'DELETE') {
+          if (itemId) {
+            batch.delete(doc(db, "items", itemId));
+          }
+          if (log) {
+            batch.set(doc(collection(db, "logs")), log);
+          }
+        }
+        await batch.commit();
+        return true; // Successfully saved online
+      } catch (err) {
+        console.warn("Direct write to Firestore failed, fallback to local queue:", err);
+      }
+    }
+
+    // 3. Store to sync queue if offline or fail
+    const newTask: SyncTask = {
+      id: Math.random().toString(36).substring(2, 9) + Date.now(),
+      action,
+      item,
+      log,
+      itemId,
+      timestamp: Date.now()
+    };
+    
+    setSyncQueue(prev => [...prev, newTask]);
+    return false; // Queued locally
+  };
+
+  // Background and on-demand synchronization processor
+  const processSyncQueue = async () => {
+    if (!navigator.onLine || syncQueue.length === 0 || isSyncingQueue) return;
+    setIsSyncingQueue(true);
+    
+    const queueToProcess = [...syncQueue];
+    let successes = 0;
+
+    try {
+      for (const t of queueToProcess) {
+        try {
+          const batch = writeBatch(db);
+          if (t.action === 'ADD' || t.action === 'EDIT' || t.action === 'MUTATION') {
+            if (t.item) {
+              batch.set(doc(db, "items", t.item.id), t.item);
+            }
+            if (t.log) {
+              batch.set(doc(collection(db, "logs")), t.log);
+            }
+          } else if (t.action === 'DELETE') {
+            if (t.itemId) {
+              batch.delete(doc(db, "items", t.itemId));
+            }
+            if (t.log) {
+              batch.set(doc(collection(db, "logs")), t.log);
+            }
+          }
+          await batch.commit();
+          successes++;
+          // Remove successfully uploaded item from the queue
+          setSyncQueue(prev => prev.filter(itemTask => itemTask.id !== t.id));
+        } catch (taskErr) {
+          console.error("Failed to sync task", t, taskErr);
+          // Stop processing further to preserve linear transactional ordering
+          break;
+        }
+      }
+      
+      if (successes > 0) {
+        alert(`Sinkronisasi berhasil! ${successes} mutasi offline berhasil diunggah ke cloud database.`);
+      }
+    } catch (e) {
+      console.error("Sync Queue Error:", e);
+    } finally {
+      setIsSyncingQueue(false);
+    }
+  };
+
+  // Run auto sync when connection comes back online
+  useEffect(() => {
+    if (isOnline && syncQueue.length > 0 && !isSyncingQueue) {
+      const runSyncTimer = setTimeout(() => {
+        processSyncQueue();
+      }, 1500);
+      return () => clearTimeout(runSyncTimer);
+    }
+  }, [isOnline, syncQueue.length]);
 
   const [googleUser, setGoogleUser] = useState<FirebaseUser | null>(null);
   const [isDriveSyncing, setIsDriveSyncing] = useState(false);
@@ -121,6 +305,8 @@ export default function App() {
     } else if (ctx.type === 'barcode-roll') {
       const count = ctx.ids?.length || 0;
       timeout = count > 10 ? 4000 : 3000;
+    } else if (ctx.type === 'custom-label-a4' || ctx.type === 'custom-label-roll') {
+      timeout = 1500;
     }
     
     setTimeout(() => {
@@ -168,11 +354,14 @@ export default function App() {
   
   // Scanner state
   const [scanInput, setScanInput] = useState("");
+  const [labelGenForm, setLabelGenForm] = useState({ id: 'BRC-1234', name: 'ASET BARU', serial: '', printType: 'barcode-roll' });
   const [cameraActive, setCameraActive] = useState(false);
   const [holderInput, setHolderInput] = useState("");
   const [sessionNameInput, setSessionNameInput] = useState("");
   const [rapidScan, setRapidScan] = useState(false);
   const [overdueHoursInput, setOverdueHoursInput] = useState<number | ''>(8);
+  const [todayPrintSort, setTodayPrintSort] = useState<'desc' | 'asc'>('desc');
+  const [todayPrintTimeframe, setTodayPrintTimeframe] = useState<string>('today');
 
   // Added states for missing html features
   const [appSettings, setAppSettings] = useState({ 
@@ -180,6 +369,7 @@ export default function App() {
   });
   const [addForm, setAddForm] = useState({ holder: '', name: '', sku: '', category: 'Senjata Api', customCategory: '', popor: '', serial: '', note: '' });
   const [opnameSession, setOpnameSession] = useState<{ active: boolean; expected: string[]; scanned: string[]; extra: string[]; out: string[]; } | null>(null);
+  const [showOpnameEndConfirm, setShowOpnameEndConfirm] = useState(false);
   const [opnameScanInput, setOpnameScanInput] = useState("");
   const [users, setUsers] = useState<any[]>(() => {
     return [{ username: 'RYO KUN', role: 'superadmin', password: '123' }];
@@ -192,8 +382,83 @@ export default function App() {
     return null;
   });
 
+  // Authentication State
+  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(() => {
+    try {
+      const saved = safeStorage.getItem("ryo_authenticated");
+      return saved === "true";
+    } catch (e) {}
+    return false;
+  });
+
   const [newUser, setNewUser] = useState({ username: '', password: '' });
-  const [autoLogout, setAutoLogout] = useState(true);
+  const [autoLogout, setAutoLogout] = useState<boolean>(() => {
+    try {
+      const saved = safeStorage.getItem("ryo_auto_logout");
+      return saved === null ? true : saved === "true";
+    } catch (e) {
+      return true;
+    }
+  });
+
+  useEffect(() => {
+    try {
+      safeStorage.setItem("ryo_auto_logout", autoLogout ? "true" : "false");
+    } catch (e) {}
+  }, [autoLogout]);
+
+  // Session / Auto Logout 2 Jam Engine
+  useEffect(() => {
+    if (!isAuthenticated) return;
+
+    // Set initial activity time
+    const updateActivity = () => {
+      try {
+        localStorage.setItem("ryo_last_activity", Date.now().toString());
+      } catch (e) {}
+    };
+
+    // Initialize activity tracking if not already set
+    try {
+      if (!localStorage.getItem("ryo_last_activity")) {
+        updateActivity();
+      }
+    } catch (e) {}
+
+    // Attach interaction listeners to reset the 2-hour inactivity countdown
+    const events = ["mousedown", "mousemove", "keypress", "scroll", "touchstart", "click"];
+    events.forEach(name => window.addEventListener(name, updateActivity));
+
+    // Monitor session every 5 seconds
+    const interval = setInterval(() => {
+      if (!autoLogout) return;
+
+      try {
+        const lastActivityStr = localStorage.getItem("ryo_last_activity");
+        if (lastActivityStr) {
+          const lastActivity = parseInt(lastActivityStr, 10);
+          const TWO_HOURS_MS = 2 * 60 * 60 * 1000; // 7,200,000 ms
+          if (Date.now() - lastActivity > TWO_HOURS_MS) {
+            // Log out!
+            setCurrentUser(null);
+            setIsAuthenticated(false);
+            safeStorage.removeItem("ryo_current_user");
+            safeStorage.removeItem("ryo_authenticated");
+            localStorage.removeItem("ryo_last_activity");
+            alert("Sesi Anda berakhir secara otomatis setelah 2 jam tidak aktif.");
+          }
+        }
+      } catch (e) {
+        console.error("Auto logout check error:", e);
+      }
+    }, 5000);
+
+    return () => {
+      events.forEach(name => window.removeEventListener(name, updateActivity));
+      clearInterval(interval);
+    };
+  }, [isAuthenticated, autoLogout]);
+
   const [currentTime, setCurrentTime] = useState(new Date());
   const [dashboardListType, setDashboardListType] = useState<"Total" | "Tersedia" | "Keluar" | null>(null);
   const [closedPushNotifs, setClosedPushNotifs] = useState<string[]>([]);
@@ -220,25 +485,18 @@ export default function App() {
 
   const [selectedItems, setSelectedItems] = useState<string[]>([]);
   const [inventoryPage, setInventoryPage] = useState(1);
-  const [inventorySort, setInventorySort] = useState<"newest" | "oldest">("newest");
+  const [inventorySort, setInventorySort] = useState<"newest" | "oldest" | "popor" | "barcode">("newest");
   const [inventorySearch, setInventorySearch] = useState("");
   const [inventoryCategoryFilter, setInventoryCategoryFilter] = useState("ALL");
   const [printLayout, setPrintLayout] = useState<"auto" | "normal" | "compact">("auto");
-  const [isOnline, setIsOnline] = useState(navigator.onLine);
+  // We moved isOnline upstream to avoid block scoping issues
   const [onlyOverdueFilter, setOnlyOverdueFilter] = useState(false);
 
   useEffect(() => {
     setInventoryPage(1);
   }, [inventorySearch, inventoryCategoryFilter, inventorySort, onlyOverdueFilter]);
   
-  // Authentication State
-  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(() => {
-    try {
-      const saved = safeStorage.getItem("ryo_authenticated");
-      return saved === "true";
-    } catch (e) {}
-    return false;
-  });
+  // (Moved upstream to prevent block scoping issues)
 
   // Overdue unified dialog state
   const [showOverdueModal, setShowOverdueModal] = useState<boolean>(false);
@@ -256,6 +514,19 @@ export default function App() {
   // Edit / Info State
   const [editingItem, setEditingItem] = useState<Item | null>(null);
   const [viewingItem, setViewingItem] = useState<Item | null>(null);
+
+  // Sensory and Layout Customization States
+  const [scanStatus, setScanStatus] = useState<'success_in' | 'success_out' | 'error' | null>(null);
+  const [themePulse, setThemePulse] = useState<{ active: boolean; type: 'dark' | 'light'; x: number; y: number } | null>(null);
+  const [showLabelStudio, setShowLabelStudio] = useState<boolean>(false);
+  const [labelLayout, setLabelLayout] = useState<'grid' | 'continuous'>('grid');
+  const [labelSize, setLabelSize] = useState<'sm' | 'md' | 'lg'>('md');
+  const [labelShowName, setLabelShowName] = useState<boolean>(false);
+  const [labelShowSKU, setLabelShowSKU] = useState<boolean>(true);
+  const [labelShowSerial, setLabelShowSerial] = useState<boolean>(false);
+  const [labelShowPopor, setLabelShowPopor] = useState<boolean>(false);
+  const [labelShowCategory, setLabelShowCategory] = useState<boolean>(false);
+  const [labelQrScale, setLabelQrScale] = useState<number>(0.75);
 
   const [isLiteMode, setIsLiteMode] = useState<boolean>(() => {
     const stored = safeStorage.getItem('ryo_lite_mode');
@@ -280,10 +551,34 @@ export default function App() {
   const filteredInventory = React.useMemo(() => {
     return inventory
       .filter(item => {
-        const searchLower = (inventorySearch || "").toLowerCase();
-        return (item.name || "").toLowerCase().includes(searchLower) || 
-               (item.id || "").toLowerCase().includes(searchLower) || 
-               (item.serial || "").toLowerCase().includes(searchLower);
+        const searchLower = (inventorySearch || "").toLowerCase().trim();
+        if (!searchLower) return true;
+
+        // Concatenate all searchable fields into a unified lowercase string
+        const searchableText = `${item.name || ""} ${item.id || ""} ${item.serial || ""} ${item.category || ""} ${item.popor || ""} ${item.holder || ""}`.toLowerCase();
+
+        // 1. Token/Keyword match: Each space-separated key must be part of the searchable text
+        const tokens = searchLower.split(/\s+/).filter(Boolean);
+        const matchesTokens = tokens.every(token => searchableText.includes(token));
+
+        // 2. Continuous Subsequence Fuzzy Match: For sequence inputs without spaces (e.g., "m16p5" matching "M16 Popor 5")
+        const isSubsequenceOf = (query: string, text: string): boolean => {
+          let queryIdx = 0;
+          let textIdx = 0;
+          while (queryIdx < query.length && textIdx < text.length) {
+            if (query[queryIdx] === text[textIdx]) {
+              queryIdx++;
+            }
+            textIdx++;
+          }
+          return queryIdx === query.length;
+        };
+
+        const cleanQuery = searchLower.replace(/[\s\-\_\/]+/g, "");
+        const cleanText = searchableText.replace(/[\s\-\_\/]+/g, "");
+        const matchesFuzzy = cleanQuery.length > 1 && isSubsequenceOf(cleanQuery, cleanText);
+
+        return matchesTokens || matchesFuzzy;
       })
       .filter(item => inventoryCategoryFilter === "ALL" || item.category === inventoryCategoryFilter)
       .filter(item => !onlyOverdueFilter || (item.status === 'Keluar' && item.dueDate && Date.now() > item.dueDate));
@@ -298,6 +593,7 @@ export default function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const excelInputRef = useRef<HTMLInputElement>(null);
   const notifiedOverdueRef = useRef<Set<string>>(new Set());
+  const lastScanRef = useRef<{ code: string; timestamp: number }>({ code: "", timestamp: 0 });
 
   useEffect(() => {
     const overdueItems = inventory.filter(i => i.status === 'Keluar' && i.dueDate && Date.now() > i.dueDate);
@@ -542,40 +838,124 @@ export default function App() {
     // localStorage.setItem("ryo_logs", JSON.stringify(newLogs));
   };
   
-   const speakAnnouncement = (item: Item, isOut: boolean) => {
+  const speakAnnouncement = (item: Item, isOut: boolean) => {
     if ('speechSynthesis' in window) {
-      const msg = new SpeechSynthesisUtterance();
-      
-      const hasHolder = item.holder && item.holder !== "-" && item.holder !== "";
-      const holderPart = hasHolder ? `atas nama ${item.holder}` : "";
+      // Safely cancel any active utterances to prioritize the latest scan
+      try {
+        window.speechSynthesis.cancel();
+      } catch (e) {
+        console.warn("SpeechSynthesis cancel error:", e);
+      }
+
+      const holderText = item.holder && item.holder !== "-" && item.holder !== "" ? item.holder : 'KOSONG';
+      const holderPart = `ATAS NAMA ${holderText}`;
       
       const hasPopor = item.popor && item.popor !== "-" && item.popor !== "";
-      const poporPart = hasPopor ? `nomor popor ${item.popor}` : "";
+      const poporPart = hasPopor ? `NO POPOR ${item.popor}` : "";
       
-      const nameText = item.name.toLowerCase();
-      const actionText = isOut ? "telah keluar dari gudang" : "telah kembali masuk gudang";
-      
-      const announcement = [nameText, holderPart, poporPart, actionText].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
-      msg.text = announcement;
-      
-      msg.lang = 'id-ID';
-      msg.rate = 0.9;
-      msg.pitch = 1;
-      
-      window.speechSynthesis.cancel();
-      window.speechSynthesis.speak(msg);
+      let announcement = "";
+      if (isOut) {
+          announcement = `${item.name}, ${holderPart}, ${poporPart ? poporPart + ', ' : ''}TELAH KELUAR GUDANG`;
+      } else {
+          announcement = `${item.name}, ${holderPart}, ${poporPart ? poporPart + ', ' : ''}TELAH KEMBALI KE GUDANG`;
+      }
+
+      // 50ms pause lets browser engines complete internal state reset successfully 
+      setTimeout(() => {
+        try {
+          const msg = new SpeechSynthesisUtterance(announcement);
+          msg.lang = 'id-ID';
+          msg.rate = 0.9;
+          msg.pitch = 1;
+          
+          // Force fallback to Indonesian voice if the browser has it loaded
+          if (window.speechSynthesis.getVoices) {
+            const voices = window.speechSynthesis.getVoices();
+            const idVoice = voices.find(v => v.lang.startsWith('id') || v.lang.includes('ID'));
+            if (idVoice) {
+              msg.voice = idVoice;
+            }
+          }
+          
+          window.speechSynthesis.speak(msg);
+        } catch (err) {
+          console.error("SpeechSynthesis speak execution error:", err);
+        }
+      }, 50);
     }
   };
 
   const handleScanCode = async (code: string) => {
     if (!code) return;
-    const itemIndex = inventory.findIndex(i => i.id.toUpperCase() === code.toUpperCase());
+    
+    // Quick scan deduplication (prevent double scan in rapidly successive triggers)
+    const now = Date.now();
+    const rawClean = code.trim().toUpperCase();
+    if (lastScanRef.current.code === rawClean && now - lastScanRef.current.timestamp < 1500) {
+      console.log("Duplicate scan trigger blocked:", rawClean);
+      return;
+    }
+    lastScanRef.current = { code: rawClean, timestamp: now };
+    
+    let processedCode = code.trim();
+    
+    // 1. Check if the scanned code is a URL (often QR Codes encode link URLs)
+    if (processedCode.startsWith("http://") || processedCode.startsWith("https://")) {
+      try {
+        const url = new URL(processedCode);
+        // Extract common query parameters for asset/item identification
+        const params = ["id", "sku", "code", "barcode", "qr", "qrc", "kode", "aset"];
+        let foundParamValue = "";
+        for (const p of params) {
+          const val = url.searchParams.get(p);
+          if (val) {
+            foundParamValue = val.trim();
+            break;
+          }
+        }
+        
+        if (foundParamValue) {
+          processedCode = foundParamValue;
+        } else {
+          // Fallback to the last non-empty path segment (e.g., https://domain.com/item/M16-100 -> M16-100)
+          const segments = url.pathname.split("/").filter(Boolean);
+          if (segments.length > 0) {
+            processedCode = segments[segments.length - 1];
+          }
+        }
+      } catch (e) {
+        console.warn("Could not parse scanned URL as a system SKU link, using raw code instead:", e);
+      }
+    }
+    
+    // 2. Clear out standard descriptors/prefixes often found in scanned barcode or QR tags
+    // e.g., "SKU: M16-01", "ID: 100", "Aset: PISTOL-03"
+    const prefixRegex = /^(sku|id|barcode|qr|qrc|qrcode|kode|aset|item|barang)\s*[:=-]\s*/i;
+    processedCode = processedCode.replace(prefixRegex, "").trim();
+    
+    // 3. Search for the matching item
+    let itemIndex = inventory.findIndex(i => i.id.toUpperCase() === processedCode.toUpperCase());
+    
+    // 4. Fallback: If no direct match is found, try if processedCode contains an existing item's ID
+    if (itemIndex === -1) {
+      itemIndex = inventory.findIndex(i => processedCode.toUpperCase().includes(i.id.toUpperCase()));
+    }
+    
+    // 5. Fallback 2: Try if an existing item's ID contains the processedCode (for partial scans, min 3 chars to avoid false positives)
+    if (itemIndex === -1 && processedCode.length >= 3) {
+      itemIndex = inventory.findIndex(i => i.id.toUpperCase().includes(processedCode.toUpperCase()));
+    }
     
     if (itemIndex >= 0) {
       const item = inventory[itemIndex];
       const isOut = item.status === "Di Gudang";
       
-      const newHolder = isOut ? (holderInput || item.holder) : "-";
+      // Sensory feedback
+      setScanStatus(isOut ? 'success_out' : 'success_in');
+      setTimeout(() => setScanStatus(null), 1200);
+      
+      // Perbaikan: Selalu gunakan nama pemegang dari database (tidak memerlukan input scanner baru).
+      const newHolder = item.holder || "-";
       
       const updatedItem: any = {
         ...item,
@@ -608,13 +988,10 @@ export default function App() {
       }
       
       try {
-        const batch = writeBatch(db);
-        batch.set(doc(db, "items", item.id), updatedItem);
-        batch.set(doc(collection(db, "logs")), newLog);
-        await batch.commit();
+        const wasSynced = await executeDatabaseOperation('MUTATION', updatedItem, newLog);
 
         // Send Email Notification if configured
-        if (isEmailNotificationEnabled && notificationEmail && googleUser) {
+        if (wasSynced && isEmailNotificationEnabled && notificationEmail && googleUser) {
           const typeLabel = isOut ? "KELUAR (CHECK-OUT)" : "KEMBALI (CHECK-IN)";
           const subject = `[MUTASI GUDANG ASET] ${updatedItem.name} - ${typeLabel}`;
           const body = `
@@ -682,18 +1059,33 @@ export default function App() {
         speakAnnouncement({ ...item, holder: isOut ? newHolder : item.holder }, isOut);
         
         if (!rapidScan) {
-          alert(`[${isOut ? 'OUT' : 'IN'}] ${item.name} berhasil di-scan.`);
+          if (wasSynced) {
+            console.log(`[${isOut ? 'OUT' : 'IN'}] ${item.name} berhasil di-scan.`);
+          } else {
+            console.log(`[OFFLINE (LOKAL)] [${isOut ? 'OUT' : 'IN'}] ${item.name} berhasil di-scan dan disimpan ke antrean lokal.`);
+          }
         }
       } catch (err) {
         console.error(err);
-        alert("Gagal sinkronisasi data dengan server online!");
       }
     } else {
-      alert("Barcode / SKU tidak ditemukan di sistem.");
+      setScanStatus('error');
+      setTimeout(() => setScanStatus(null), 1200);
+      try {
+         if ('speechSynthesis' in window) {
+            window.speechSynthesis.cancel();
+            const utterance = new SpeechSynthesisUtterance("ASET TIDAK DITEMUKAN");
+            utterance.lang = 'id-ID';
+            utterance.rate = 1.0;
+            window.speechSynthesis.speak(utterance);
+         }
+      } catch (err) {
+         console.warn("SpeechSynthesis error:", err);
+      }
     }
   };
 
-  const handleAddItem = () => {
+  const handleAddItem = async () => {
     if (!addForm.name || !addForm.sku) {
       alert("NAMA BARANG DAN KODE SKU WAJIB DIISI!");
       return;
@@ -733,16 +1125,17 @@ export default function App() {
     };
     
     try {
-      const batch = writeBatch(db);
-      batch.set(doc(db, "items", newItem.id), newItem);
-      batch.set(doc(collection(db, "logs")), newLog);
-      batch.commit();
+      const wasSynced = await executeDatabaseOperation('ADD', newItem, newLog);
       
       setAddForm({ holder: '', name: '', sku: '', category: appSettings.categories[0], customCategory: '', popor: '', serial: '', note: '' });
-      alert("DATA ASET BERHASIL DISIMPAN ONLINE!");
+      if (wasSynced) {
+        alert("DATA ASET BERHASIL DISIMPAN ONLINE!");
+      } else {
+        alert("DATA ASET BERHASIL DISIMPAN LOKAL (Offline Queue)!");
+      }
     } catch (e) {
       console.error(e);
-      alert("Gagal menyimpan data ke database server!");
+      alert("Gagal menyimpan data!");
     }
   };
 
@@ -767,6 +1160,66 @@ export default function App() {
     }
     setOpnameSession(updated);
   };
+  
+  // Handler Keystroke Global untuk Pemindai Scanner Fisik / Gun Barcode
+  useEffect(() => {
+    let buffer = "";
+    let lastKeyTime = Date.now();
+
+    const handleGlobalKeyDown = (e: KeyboardEvent) => {
+      // 1. Jika fokus sedang berada di kolom teks (input/textarea) biasa, jangan interupsi ketikan pengguna
+      const activeEl = document.activeElement;
+      if (activeEl && (
+        activeEl.tagName === 'INPUT' || 
+        activeEl.tagName === 'TEXTAREA' || 
+        (activeEl as HTMLElement).isContentEditable
+      )) {
+        return;
+      }
+
+      // Abaikan tombol pintasan dengan modifier (Ctrl/Alt/Cmd)
+      if (e.ctrlKey || e.altKey || e.metaKey) {
+        return;
+      }
+
+      const now = Date.now();
+      // Reset buffer jika jeda pengetikan melebihi 600ms (biasanya input dari tembakan scanner sangat instan < 50ms)
+      if (now - lastKeyTime > 600) {
+        buffer = "";
+      }
+      lastKeyTime = now;
+
+      // Sebagian besar unit scanner fisik mengirimkan tombol 'Enter' (Carriage Return) sebagai penutup scan
+      if (e.key === 'Enter') {
+        const cleanedCode = buffer.trim();
+        if (cleanedCode.length >= 2) {
+          e.preventDefault();
+          
+          // Jika operator sedang membuka tab Stock Opname Aktif, arahkan input langsung ke stock opname
+          if (activeTab === 'opname' && opnameSession?.active) {
+            handleOpnameScan(cleanedCode);
+          } else {
+            // Pengalihan otomatis ke Menu/Tab Scanner utama
+            setActiveTab('scanner');
+            setScanInput(cleanedCode);
+            handleScanCode(cleanedCode);
+          }
+          buffer = "";
+        }
+        return;
+      }
+
+      // Hanya tampung karakter tunggal yang valid/printable
+      if (e.key.length === 1) {
+        buffer += e.key;
+      }
+    };
+
+    window.addEventListener('keydown', handleGlobalKeyDown);
+    return () => {
+      window.removeEventListener('keydown', handleGlobalKeyDown);
+    };
+  }, [activeTab, opnameSession, handleScanCode, handleOpnameScan]);
   
   const handleExportExcel = () => {
     const toExport = inventory.filter(item => selectedItems.length === 0 || selectedItems.includes(item.id));
@@ -798,70 +1251,62 @@ export default function App() {
         const data = XLSX.utils.sheet_to_json(ws);
         
         let importedCount = 0;
-        const operationsPerItem = 2; // insert + log
-        const MAX_BATCH_OPERATIONS = 480;
-        const MAX_ITEMS_PER_BATCH = Math.floor(MAX_BATCH_OPERATIONS / operationsPerItem);
+        let wasSyncedAll = true;
         
-        const chunks = [];
-        for (let i = 0; i < data.length; i += MAX_ITEMS_PER_BATCH) {
-           chunks.push(data.slice(i, i + MAX_ITEMS_PER_BATCH));
+        for (const row of data as any[]) {
+            const skuRaw = row["SKU/Barcode"] || row["SKU"] || row["Barcode"];
+            const nameRaw = row["Nama Aset"] || row["Nama"] || row["Nama Barang"];
+            
+            if (skuRaw === undefined || nameRaw === undefined) continue;
+            
+            const sku = String(skuRaw).trim().toUpperCase();
+            const name = String(nameRaw).trim().toUpperCase();
+            
+            if (!sku || !name) continue;
+            // Ignore duplicate inside current state
+            if (inventory.find(item => item.id === sku)) continue;
+            
+            const category = String(row["Kategori"] || "Senjata Api").toUpperCase();
+            const serial = String(row["Nomor Seri"] || row["Serial"] || "-").toUpperCase();
+            const popor = String(row["Nomor Popor"] || row["Popor"] || "-").toUpperCase();
+            const holder = String(row["Pemegang"] || "-").toUpperCase();
+            const statusRaw = String(row["Status"] || "Di Gudang");
+            const note = String(row["Keterangan"] || row["Catatan"] || "-").toUpperCase();
+            
+            const newItem: Item = {
+              id: sku,
+              name: name,
+              category: category,
+              serial: serial,
+              popor: popor,
+              holder: holder,
+              note: note,
+              status: statusRaw === "Di Gudang" || statusRaw === "Keluar" ? statusRaw : "Di Gudang",
+              date: new Date().toISOString().split('T')[0]
+            };
+            
+            const newLog: Log = {
+              id: newItem.id,
+              name: newItem.name,
+              status: newItem.status,
+              type: "ADD",
+              holder: newItem.holder,
+              time: new Date().toLocaleTimeString('id-ID'),
+              fullDate: new Date().toLocaleDateString('id-ID'),
+              operator: "SYSTEM IMPORT",
+              timestamp: Date.now() + importedCount
+            };
+            
+            const wasSynced = await executeDatabaseOperation('ADD', newItem, newLog);
+            if (!wasSynced) wasSyncedAll = false;
+            importedCount++;
         }
         
-        for (const chunk of chunks) {
-            const batch = writeBatch(db);
-            for (const row of chunk as any[]) {
-                const skuRaw = row["SKU/Barcode"] || row["SKU"] || row["Barcode"];
-                const nameRaw = row["Nama Aset"] || row["Nama"] || row["Nama Barang"];
-                
-                if (skuRaw === undefined || nameRaw === undefined) continue;
-                
-                const sku = String(skuRaw).trim().toUpperCase();
-                const name = String(nameRaw).trim().toUpperCase();
-                
-                if (!sku || !name) continue;
-                // Ignore duplicate inside current state
-                if (inventory.find(item => item.id === sku)) continue;
-                
-                const category = String(row["Kategori"] || "Senjata Api").toUpperCase();
-                const serial = String(row["Nomor Seri"] || row["Serial"] || "-").toUpperCase();
-                const popor = String(row["Nomor Popor"] || row["Popor"] || "-").toUpperCase();
-                const holder = String(row["Pemegang"] || "-").toUpperCase();
-                const statusRaw = String(row["Status"] || "Di Gudang");
-                const note = String(row["Keterangan"] || row["Catatan"] || "-").toUpperCase();
-                
-                const newItem: Item = {
-                  id: sku,
-                  name: name,
-                  category: category,
-                  serial: serial,
-                  popor: popor,
-                  holder: holder,
-                  note: note,
-                  status: statusRaw === "Di Gudang" || statusRaw === "Keluar" ? statusRaw : "Di Gudang",
-                  date: new Date().toISOString().split('T')[0]
-                };
-                
-                batch.set(doc(db, "items", newItem.id), newItem);
-                
-                const newLog: Log = {
-                  id: newItem.id,
-                  name: newItem.name,
-                  status: newItem.status,
-                  type: "ADD",
-                  holder: newItem.holder,
-                  time: new Date().toLocaleTimeString('id-ID'),
-                  fullDate: new Date().toLocaleDateString('id-ID'),
-                  operator: "SYSTEM IMPORT",
-                  timestamp: Date.now() + importedCount
-                };
-                batch.set(doc(collection(db, "logs")), newLog);
-                
-                importedCount++;
-            }
-            await batch.commit();
+        if (wasSyncedAll) {
+          alert(`Berhasil mengimpor ${importedCount} aset dari Excel ke database online!`);
+        } else {
+          alert(`Berhasil mengimpor ${importedCount} aset dari Excel ke Simpanan Lokal (Offline Queue).`);
         }
-        
-        alert(`Berhasil mengimpor ${importedCount} aset dari Excel!`);
       } catch (err) {
         console.error(err);
         alert("Gagal mengimpor data Excel.");
@@ -876,41 +1321,41 @@ export default function App() {
   };
 
   const handleSaveEdit = async () => {
-     if (!editingItem) return;
-     
-     const cleanSerial = (editingItem.serial || '').trim().toUpperCase();
-     if (cleanSerial && cleanSerial !== '-') {
-       const existingWithSameSerial = inventory.find(i => i.serial.toUpperCase() === cleanSerial && i.id !== editingItem.id);
-       if (existingWithSameSerial) {
-          alert(`GAGAL: NOMOR SERI [${cleanSerial}] SUDAH DIGUNAKAN OLEH SKU [${existingWithSameSerial.id}]!`);
-          return;
-       }
-     }
+    if (!editingItem) return;
+    
+    const cleanSerial = (editingItem.serial || '').trim().toUpperCase();
+    if (cleanSerial && cleanSerial !== '-') {
+      const existingWithSameSerial = inventory.find(i => i.serial.toUpperCase() === cleanSerial && i.id !== editingItem.id);
+      if (existingWithSameSerial) {
+         alert(`GAGAL: NOMOR SERI [${cleanSerial}] SUDAH DIGUNAKAN OLEH SKU [${existingWithSameSerial.id}]!`);
+         return;
+      }
+    }
 
-     try {
-       const batch = writeBatch(db);
-       batch.set(doc(db, "items", editingItem.id), editingItem);
-       
-       const newLog: Log = {
-          id: editingItem.id,
-          name: editingItem.name,
-          status: editingItem.status,
-          type: "EDIT",
-          holder: editingItem.holder,
-          time: new Date().toLocaleTimeString('id-ID'),
-          fullDate: new Date().toLocaleDateString('id-ID'),
-          operator: currentUser?.username || "SYSTEM",
-          timestamp: Date.now()
-       };
-       batch.set(doc(collection(db, "logs")), newLog);
+    try {
+      const newLog: Log = {
+         id: editingItem.id,
+         name: editingItem.name,
+         status: editingItem.status,
+         type: "EDIT",
+         holder: editingItem.holder,
+         time: new Date().toLocaleTimeString('id-ID'),
+         fullDate: new Date().toLocaleDateString('id-ID'),
+         operator: currentUser?.username || "SYSTEM",
+         timestamp: Date.now()
+      };
 
-       await batch.commit();
-       setEditingItem(null);
-       alert("Perubahan berhasil disimpan.");
-     } catch (err) {
-       console.error(err);
-       alert("Gagal menyimpan perubahan.");
-     }
+      const wasSynced = await executeDatabaseOperation('EDIT', editingItem, newLog);
+      setEditingItem(null);
+      if (wasSynced) {
+        alert("Perubahan berhasil disimpan.");
+      } else {
+        alert("Perubahan disimpan secara lokal (Offline Queue).");
+      }
+    } catch (err) {
+      console.error(err);
+      alert("Gagal menyimpan perubahan.");
+    }
   };
 
   const handleDeleteSelected = async () => {
@@ -921,38 +1366,32 @@ export default function App() {
     }
     
     try {
-      // Create chunks to avoid Firestore 500 writes limit (deleting 1 item = 2 operations: delete + log)
-      const operationsPerItem = 2;
-      const MAX_BATCH_OPERATIONS = 480;
-      const MAX_ITEMS_PER_BATCH = Math.floor(MAX_BATCH_OPERATIONS / operationsPerItem);
-      
-      const itemChunks: string[][] = [];
-      for (let i = 0; i < selectedItems.length; i += MAX_ITEMS_PER_BATCH) {
-         itemChunks.push(selectedItems.slice(i, i + MAX_ITEMS_PER_BATCH));
-      }
-      
-      for (const chunk of itemChunks) {
-         const batch = writeBatch(db);
-         for (const id of chunk) {
-            batch.delete(doc(db, "items", id));
-            const newLog: Log = {
-              id: id,
-              name: "ASET " + id,
-              status: "DIHAPUS",
-              type: "DELETE",
-              holder: "SYSTEM",
-              time: new Date().toLocaleTimeString('id-ID'),
-              fullDate: new Date().toLocaleDateString('id-ID'),
-              operator: currentUser?.username || "SYSTEM",
-              timestamp: Date.now()
-            };
-            batch.set(doc(collection(db, "logs")), newLog);
-         }
-         await batch.commit();
+      let successes = 0;
+      let wasSyncedAll = true;
+
+      for (const id of selectedItems) {
+         const newLog: Log = {
+           id: id,
+           name: "ASET " + id,
+           status: "DIHAPUS",
+           type: "DELETE",
+           holder: "SYSTEM",
+           time: new Date().toLocaleTimeString('id-ID'),
+           fullDate: new Date().toLocaleDateString('id-ID'),
+           operator: currentUser?.username || "SYSTEM",
+           timestamp: Date.now() + successes
+         };
+         const wasSynced = await executeDatabaseOperation('DELETE', null, newLog, id);
+         if (!wasSynced) wasSyncedAll = false;
+         successes++;
       }
       
       setSelectedItems([]);
-      alert("Aset berhasil dihapus.");
+      if (wasSyncedAll) {
+        alert("Aset berhasil dihapus.");
+      } else {
+        alert("Aset berhasil dihapus secara lokal (Offline Queue).");
+      }
     } catch(err) {
       console.error(err);
       alert("Gagal menghapus aset.");
@@ -964,25 +1403,21 @@ export default function App() {
     if (!isConfirmed) return;
     
     try {
-      const operationsPerItem = 1;
-      const MAX_BATCH_OPERATIONS = 480;
-      const MAX_ITEMS_PER_BATCH = Math.floor(MAX_BATCH_OPERATIONS / operationsPerItem);
-      
-      const itemChunks: Item[][] = [];
-      for (let i = 0; i < inventory.length; i += MAX_ITEMS_PER_BATCH) {
-         itemChunks.push(inventory.slice(i, i + MAX_ITEMS_PER_BATCH));
-      }
-      
-      for (const chunk of itemChunks) {
-         const batch = writeBatch(db);
-         for (const item of chunk) {
-            batch.delete(doc(db, "items", item.id));
-         }
-         await batch.commit();
+      let successes = 0;
+      let wasSyncedAll = true;
+
+      for (const item of [...inventory]) {
+         const wasSynced = await executeDatabaseOperation('DELETE', null, null, item.id);
+         if (!wasSynced) wasSyncedAll = false;
+         successes++;
       }
       
       setSelectedItems([]);
-      alert("Semua aset berhasil dihapus.");
+      if (wasSyncedAll) {
+        alert("Semua aset berhasil dihapus.");
+      } else {
+        alert("Semua aset berhasil dihapus secara lokal (Offline Queue).");
+      }
     } catch(err) {
       console.error(err);
       alert("Terjadi kesalahan saat menghapus semua aset");
@@ -990,36 +1425,36 @@ export default function App() {
   };
 
   const handleIndividualDelete = async (id: string) => {
-     const isConfirmed = confirm(`Apakah Anda yakin ingin menghapus aset ${id} secara PERMANEN?`);
-     if (!isConfirmed) {
-       return;
-     }
+      const isConfirmed = confirm(`Apakah Anda yakin ingin menghapus aset ${id} secara PERMANEN?`);
+      if (!isConfirmed) {
+        return;
+      }
 
-     try {
-       const batch = writeBatch(db);
-       batch.delete(doc(db, "items", id));
-       
-       const newLog: Log = {
-          id: id,
-          name: "ASET " + id,
-          status: "DIHAPUS",
-          type: "DELETE",
-          holder: "SYSTEM",
-          time: new Date().toLocaleTimeString('id-ID'),
-          fullDate: new Date().toLocaleDateString('id-ID'),
-          operator: currentUser?.username || "SYSTEM",
-          timestamp: Date.now()
-       };
-       batch.set(doc(collection(db, "logs")), newLog);
+      try {
+        const newLog: Log = {
+           id: id,
+           name: "ASET " + id,
+           status: "DIHAPUS",
+           type: "DELETE",
+           holder: "SYSTEM",
+           time: new Date().toLocaleTimeString('id-ID'),
+           fullDate: new Date().toLocaleDateString('id-ID'),
+           operator: currentUser?.username || "SYSTEM",
+           timestamp: Date.now()
+        };
 
-       await batch.commit();
-       setSelectedItems(selectedItems.filter(item => item !== id));
-       alert("Aset berhasil dihapus.");
-     } catch (err) {
-       console.error(err);
-       alert("Gagal menghapus aset.");
-     }
-  };
+        const wasSynced = await executeDatabaseOperation('DELETE', null, newLog, id);
+        setSelectedItems(selectedItems.filter(item => item !== id));
+        if (wasSynced) {
+          alert("Aset berhasil dihapus.");
+        } else {
+          alert("Aset berhasil dihapus secara lokal (Offline Queue).");
+        }
+      } catch (err) {
+        console.error(err);
+        alert("Gagal menghapus aset.");
+      }
+   };
 
   const handleBackupDB = () => {
     const backupData = {
@@ -1125,7 +1560,13 @@ export default function App() {
       alert("Koneksi Google Sheets Berhasil! File 'Database Inventaris Gudang' telah terhubung dan disinkronkan.");
     } catch (err: any) {
       console.error(err);
-      alert("Gagal menghubungkan Google Sheets: " + (err.message || err));
+      if (err.message?.includes('kedaluwarsa') || err.message?.includes('401')) {
+         alert("Sesi Google Sheets Anda telah kedaluwarsa. Aplikasi akan mengeluarkan akun Google Anda. Harap Login kembali.");
+         googleLogout();
+         setGoogleUser(null);
+      } else {
+         alert("Gagal menghubungkan Google Sheets: " + (err.message || err));
+      }
     } finally {
       setIsSheetsSyncing(false);
     }
@@ -1139,7 +1580,13 @@ export default function App() {
       alert("Sinkronisasi Google Sheets Berhasil!");
     } catch (err: any) {
       console.error(err);
-      alert("Gagal sinkronisasi Google Sheets: " + (err.message || err));
+      if (err.message?.includes('kedaluwarsa') || err.message?.includes('401')) {
+         alert("Sesi Google Sheets Anda telah kedaluwarsa. Aplikasi akan mengeluarkan akun Google Anda. Harap Login kembali.");
+         googleLogout();
+         setGoogleUser(null);
+      } else {
+         alert("Gagal sinkronisasi Google Sheets: " + (err.message || err));
+      }
     } finally {
       setIsSheetsSyncing(false);
     }
@@ -1175,7 +1622,13 @@ export default function App() {
       alert("Sinkronisasi dua arah berhasil! Database lokal dan Firebase telah diperbarui sesuai isi Google Sheets.");
     } catch (err: any) {
       console.error(err);
-      alert("Gagal sinkronisasi dari Google Sheets: " + (err.message || err));
+      if (err.message?.includes('kedaluwarsa') || err.message?.includes('401')) {
+         alert("Sesi Google Sheets Anda telah kedaluwarsa. Aplikasi akan mengeluarkan akun Google Anda. Harap Login kembali.");
+         googleLogout();
+         setGoogleUser(null);
+      } else {
+         alert("Gagal sinkronisasi dari Google Sheets: " + (err.message || err));
+      }
     } finally {
       setIsSheetsSyncing(false);
     }
@@ -1189,8 +1642,14 @@ export default function App() {
       try {
         console.log("Auto-syncing newest state to Google Sheets...");
         await syncDataToSpreadsheet(sheetsSpreadsheetId, inventory, logs);
-      } catch (err) {
-        console.error("Autosync Sheets Gagal:", err);
+      } catch (err: any) {
+        if (err.message?.includes('kedaluwarsa') || err.message?.includes('401')) {
+           alert("Sesi Google Sheets Anda telah kedaluwarsa. Aplikasi akan mengeluarkan akun Google Anda. Harap Login kembali.");
+           googleLogout();
+           setGoogleUser(null);
+        } else {
+           console.error("Autosync Sheets Gagal:", err);
+        }
       }
     }, 4000); // 4 seconds debouncing
 
@@ -1254,6 +1713,23 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
       }
   };
 
+  const handleDeleteFromDrive = async (fileId: string, fileName: string) => {
+      if (!confirm(`Apakah Anda yakin ingin menghapus file cadangan:\n${fileName}\ndari Google Drive Anda secara permanen?`)) return;
+      
+      setIsDriveSyncing(true);
+      try {
+          await deleteFileFromDrive(fileId);
+          const files = await listBackupFilesInDrive();
+          setDriveBackups(files);
+          alert("File cadangan berhasil dihapus dari Google Drive!");
+      } catch (err: any) {
+          console.error(err);
+          alert("Gagal menghapus file cadangan dari Google Drive.");
+      } finally {
+          setIsDriveSyncing(false);
+      }
+  };
+
   const handleSetupBot = () => {
     setActiveTab('profile');
   };
@@ -1280,23 +1756,34 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
 
   useEffect(() => {
     let scanner: Html5QrcodeScanner | null = null;
+    let timer: any = null;
+    
     if (cameraActive) {
-      scanner = new Html5QrcodeScanner(
-        "reader",
-        { fps: 10, qrbox: { width: 250, height: 250 } },
-        false
-      );
-      scanner.render(
-        (decodedText) => {
-          handleScanCode(decodedText);
-          setCameraActive(false);
-        },
-        (error) => {
-          // ignore error to keep scanning
+      timer = setTimeout(() => {
+        try {
+          if (!document.getElementById("reader")) return;
+          scanner = new Html5QrcodeScanner(
+            "reader",
+            { fps: 10, qrbox: { width: 250, height: 250 } },
+            false
+          );
+          scanner.render(
+            (decodedText) => {
+              handleScanCode(decodedText);
+              setCameraActive(false);
+            },
+            (error) => {
+              // ignore error to keep scanning
+            }
+          );
+        } catch (err) {
+          console.error("Failed to start Html5QrcodeScanner:", err);
         }
-      );
+      }, 100);
     }
+    
     return () => {
+      if (timer) clearTimeout(timer);
       if (scanner) {
         scanner.clear().catch((error) => console.error("Failed to clear scanner", error));
       }
@@ -1321,10 +1808,25 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
     }
   }, [appTheme]);
 
-  const toggleTheme = () => {
+  const toggleTheme = (e?: React.MouseEvent) => {
+    const x = e ? e.clientX : window.innerWidth / 2;
+    const y = e ? e.clientY : window.innerHeight / 2;
     const newTheme = appTheme === 'dark' ? 'light' : 'dark';
+    
+    setThemePulse({
+      active: true,
+      type: newTheme,
+      x,
+      y
+    });
+
     setAppTheme(newTheme);
     safeStorage.setItem('ryo_theme', newTheme);
+    
+    // Auto-clear theme transition wave after animation completes
+    setTimeout(() => {
+      setThemePulse(null);
+    }, 1100);
   };
 
   if (!isAuthenticated || !currentUser) {
@@ -1334,16 +1836,28 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
       try {
         safeStorage.setItem("ryo_current_user", JSON.stringify(user));
         safeStorage.setItem("ryo_authenticated", "true");
+        localStorage.setItem("ryo_last_activity", Date.now().toString());
       } catch (e) {}
     }} />;
   }
 
   return (
-    <div className={`${appTheme === 'dark' ? 'dark' : ''} w-full h-full`}>
-      <div className="scanline-overlay opacity-0 dark:opacity-100"></div>
-      <div className="fixed inset-0 bg-tactical-grid opacity-0 dark:opacity-[0.03] pointer-events-none z-0"></div>
-      
-    <div className={`h-screen flex flex-col md:flex-row overflow-hidden relative ${isLiteMode ? 'bg-slate-50 dark:bg-[#020617]' : 'bg-radar dark:bg-radar'} print:bg-white print:block print:h-auto print:overflow-visible transition-colors duration-500`}>
+    <MotionConfig transition={(isLiteMode || perfMode) ? { duration: 0 } : undefined}>
+      <div className={`${appTheme === 'dark' ? 'dark' : ''} w-full h-full`}>
+        {!(isLiteMode || perfMode) && <div className="scanline-overlay opacity-0 dark:opacity-100"></div>}
+        {!(isLiteMode || perfMode) && <div className="fixed inset-0 bg-tactical-grid opacity-0 dark:opacity-[0.03] pointer-events-none z-0"></div>}
+        
+      <div className={`h-screen flex flex-col md:flex-row overflow-hidden relative ${(isLiteMode || perfMode) ? 'bg-slate-50 dark:bg-[#020617]' : 'bg-radar dark:bg-radar'} print:bg-white print:block print:h-auto print:overflow-visible transition-colors duration-500`}>
+        {themePulse && !(isLiteMode || perfMode) && (
+        <span 
+          className="radar-pulse-wave radar-pulse-wave-active" 
+          style={{ 
+            left: `${themePulse.x}px`, 
+            top: `${themePulse.y}px`, 
+            color: themePulse.type === 'dark' ? '#10b981' : '#3b82f6' 
+          }} 
+        />
+      )}
       {/* Decorative Labels */}
       <div className="fixed left-0 top-1/2 -translate-y-1/2 -rotate-90 origin-left ml-2 hidden lg:block z-0 opacity-0 dark:opacity-20 pointer-events-none">
         <p className="text-[9px] font-black text-emerald-500 uppercase tracking-[0.6em] whitespace-nowrap">{"TACTICAL INVENTORY (V5.2)"}</p>
@@ -1365,7 +1879,71 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
             </button>
 
             <style>
-              {printContext.type === 'barcode-roll' ? `
+              {`
+                @media print {
+                  html, body {
+                    height: auto !important;
+                    min-height: auto !important;
+                    overflow: visible !important;
+                    overflow-x: visible !important;
+                    overflow-y: visible !important;
+                    position: static !important;
+                  }
+                  /* Force all parent containers of the print layers to cooperate */
+                  div, main, body > div {
+                    overflow: visible !important;
+                    height: auto !important;
+                    max-height: none !important;
+                    min-height: 0 !important;
+                  }
+                  /* Reset any screen-height layouts to let content flow vertically */
+                  .h-screen {
+                    height: auto !important;
+                    min-height: 0 !important;
+                    overflow: visible !important;
+                    position: static !important;
+                    display: block !important;
+                  }
+                  /* ULTRA-COMPACT PRINT OVERRIDES */
+                  table {
+                    width: 100% !important;
+                    border-collapse: collapse !important;
+                    margin-bottom: 4px !important;
+                  }
+                  th, td {
+                    padding: 1.5px 2px !important;
+                    font-size: 6pt !important;
+                    line-height: 1 !important;
+                    letter-spacing: -0.01em !important;
+                    border: 0.5px solid rgba(0, 0, 0, 0.2) !important;
+                  }
+                  th {
+                    -webkit-print-color-adjust: exact !important;
+                    color-adjust: exact !important;
+                  }
+                  h1 {
+                    font-size: 11pt !important;
+                    margin: 0 !important;
+                    line-height: 1.1 !important;
+                  }
+                  h2 {
+                    font-size: 8pt !important;
+                    margin: 2px 0 !important;
+                    padding: 1px 0 !important;
+                    line-height: 1.1 !important;
+                  }
+                  h3 {
+                    font-size: 7pt !important;
+                    margin: 2px 0 1px 0 !important;
+                    line-height: 1.1 !important;
+                  }
+                  p {
+                    margin-bottom: 1px !important;
+                    font-size: 6.5pt !important;
+                  }
+                }
+              `}
+              {printContext.type === 'barcode-roll' || printContext.type === 'custom-label-roll' ? `
                 @media print {
                   @page { margin: 0; size: auto; }
                   body { background: white !important; margin: 0; padding: 0; }
@@ -1379,66 +1957,162 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
             </style>
             
             {/* Header for all prints */}
-            {printContext.type !== 'inventory-selection' && printContext.type !== 'barcode-roll' && (
-                <div className="border-b-2 border-black pb-4 mb-6 flex items-center justify-between p-4 print:p-0">
+            {printContext.type !== 'inventory-selection' && printContext.type !== 'barcode-roll' && printContext.type !== 'custom-label-a4' && printContext.type !== 'custom-label-roll' && (
+                <div className="border-b-2 border-black pb-2 mb-4 print:pb-1.5 print:mb-3 flex items-center justify-between p-4 print:p-0">
                     <div>
-                        <h1 className="text-2xl font-black uppercase tracking-tight">SISTEM MANAJEMEN GUDANG SENJATA</h1>
-                        <p className="text-sm font-bold mt-1">BATALYON B PELOPOR</p>
-                        <p className="text-[10px] font-medium text-slate-500 mt-1">Developed by RYO KUN</p>
+                        <h1 className="text-xl md:text-2xl font-black uppercase tracking-tight print:text-lg">SISTEM MANAJEMEN GUDANG SENJATA</h1>
+                        <p className="text-xs md:text-sm font-bold mt-0.5 print:text-[10px]">BATALYON B PELOPOR</p>
+                        <p className="text-[9px] md:text-[10px] font-medium text-slate-500 mt-0.5 print:text-[8px]">Developed by RYO KUN</p>
                     </div>
                     <div className="text-right">
-                        <p className="text-xs font-mono">TANGGAL CETAK</p>
-                        <p className="text-sm font-bold">{new Date().toLocaleString('id-ID')}</p>
-                        <p className="text-xs mt-1 font-mono tracking-widest">{printContext.type}</p>
+                        <p className="text-[10px] md:text-xs font-mono">TANGGAL CETAK</p>
+                        <p className="text-xs md:text-sm font-bold">{new Date().toLocaleString('id-ID')}</p>
+                        <p className="text-[10px] md:text-xs mt-0.5 font-mono tracking-widest">{printContext.type}</p>
                     </div>
                 </div>
             )}
 
             {/* Print Type: Selection Barcodes */}
-            {printContext.type === 'inventory-selection' && (
-                <div className={`flex flex-wrap p-1 print:p-0 justify-start items-start ${printContext.compact ? 'gap-1 print:gap-1.5' : 'gap-1.5 print:gap-2'}`}>
-                    {inventory
-                      .filter(i => printContext.ids.includes(i.id))
-                      .sort((a, b) => a.id.localeCompare(b.id, undefined, { numeric: true, sensitivity: 'base' }))
-                      .map(item => (
-                        <div key={item.id} className={`border border-black/50 flex flex-col justify-start items-center text-center bg-white w-fit ${printContext.compact ? 'p-0.5' : 'p-1'}`} style={{ pageBreakInside: 'avoid', breakInside: 'avoid', margin: '1px' }}>
-                            <div className={`truncate font-black uppercase leading-tight mb-0.5 border-b border-black w-full bg-slate-50 ${printContext.compact ? 'max-w-[110px] print:max-w-[120px] text-[7px] print:text-[8px]' : 'max-w-[140px] print:max-w-[160px] text-[8px] print:text-[9px]'}`}>{item.name}</div>
-                            
-                            <div className="flex items-center gap-2 px-1">
-                                <div className="p-0.5">
-                                    <Barcode 
-                                      value={item.id} 
-                                      width={printContext.compact ? 1.0 : 1.2} 
-                                      height={printContext.compact ? 22 : 30} 
-                                      fontSize={printContext.compact ? 8 : 9} 
-                                      textPosition="bottom" 
-                                      margin={2} 
-                                      background="#ffffff" 
-                                      lineColor="#000000" 
-                                      displayValue={true} 
-                                      renderer="svg"
-                                      format="CODE128"
-                                    />
-                                </div>
-                                
-                                {/* QR Code Side-by-Side - Now enabled for both modes with scaling */}
-                                <div className={`pl-2 border-l border-black/20 py-1 flex items-center justify-center`}>
-                                  <QRCodeSVG value={item.id} size={printContext.compact ? 32 : 44} includeMargin={false} />
-                                </div>
-                            </div>
-                        </div>
-                    ))}
+            {(printContext.type === 'inventory-selection' || printContext.type === 'custom-label-a4') && (
+                <div className="block p-0.5 print:p-0">
+                    {(printContext.type === 'custom-label-a4' 
+                      ? Array.from({ length: printContext.quantity || 1 }).map((_, i) => ({
+                          id: (printContext.data.id || 'CUST') + (printContext.quantity > 1 ? `-${i}` : ''),
+                          name: printContext.data.name || 'LABEL CUSTOM',
+                          serial: printContext.data.serial || '-',
+                          category: printContext.data.category || '',
+                          sku: printContext.data.sku || '',
+                          popor: printContext.data.popor || '',
+                          note: ''
+                        }))
+                      : inventory
+                          .filter(i => printContext.ids.includes(i.id))
+                          .sort((a, b) => a.id.localeCompare(b.id, undefined, { numeric: true, sensitivity: 'base' }))
+                    ).map((item, mapIndex) => {
+                         const hasStudio = !!printContext.customStudio;
+                         const studio = printContext.customStudio || {};
+                         const showName = hasStudio ? studio.showName : false;
+                         const showSKU = hasStudio ? studio.showSKU : true;
+                         const showSerial = hasStudio ? studio.showSerial : false;
+                         const showPopor = hasStudio ? studio.showPopor : false;
+                         const showCategory = hasStudio ? studio.showCategory : false;
+                         const size = hasStudio ? studio.size : (printContext.compact ? 'sm' : 'md');
+                         
+                         const isMinimalOnly = !showName && !showCategory && !showSerial && !showPopor;
+                         
+                         let baseWidth = isMinimalOnly ? 110 : 190;
+                         let defaultQrSize = 36;
+                         let defaultBarcodeHeight = 22;
+                         let defaultBarcodeWidth = 0.85;
+                         
+                         if (size === 'sm') {
+                           baseWidth = isMinimalOnly ? 85 : 140;
+                           defaultQrSize = 24;
+                           defaultBarcodeHeight = 14;
+                           defaultBarcodeWidth = 0.65;
+                         } else if (size === 'lg') {
+                           baseWidth = isMinimalOnly ? 155 : 245;
+                           defaultQrSize = 48;
+                           defaultBarcodeHeight = 30;
+                           defaultBarcodeWidth = 1.25;
+                         }
+                         
+                         const qrScale = hasStudio && typeof studio.qrScale === 'number' ? studio.qrScale : 0.75;
+                         const computedWidth = Math.round(baseWidth * qrScale);
+                         const qrSize = Math.round(defaultQrSize * qrScale);
+                         const barcodeHeight = Math.round(defaultBarcodeHeight * qrScale);
+                         const barcodeWidth = parseFloat((defaultBarcodeWidth * qrScale).toFixed(2));
+
+                         const hasDetailsUnder = showCategory || (showSerial && item.serial !== '-') || (showPopor && item.popor !== '-');
+                         const showMetaFooter = showName || hasDetailsUnder;
+
+                         return (
+                           <div 
+                             key={`${item.id}_${mapIndex}`} 
+                             className="border border-dashed border-slate-400 inline-flex flex-col justify-center p-1 bg-white text-black align-top m-1 print:m-1" 
+                              style={{ 
+                                width: `${computedWidth}px`,
+                                pageBreakInside: 'avoid', 
+                                breakInside: 'avoid', 
+                              }}
+                           >
+                             {showName && (
+                               <div 
+                                 className="truncate font-black uppercase leading-tight mb-1 border-b border-black w-full bg-slate-100 text-center pb-0.5"
+                                 style={{ fontSize: `${Math.max(6, Math.round(10 * qrScale))}px` }}
+                               >
+                                 {item.name}
+                               </div>
+                             )}
+                             
+                             <div className="flex items-center gap-0.5 px-0.5 w-full justify-center overflow-hidden">
+                                 {/* QR Code */}
+                                 <div className="p-0 shrink-0 flex items-center justify-center bg-white">
+                                     <QRCodeSVG value={item.id} size={qrSize} includeMargin={false} />
+                                 </div>
+                                 
+                                 {/* Barcode SKU */}
+                                 {showSKU && (
+                                   <div className="shrink-0 flex flex-col items-center justify-center overflow-hidden ml-1">
+                                       <Barcode 
+                                         value={item.id} 
+                                         width={barcodeWidth} 
+                                         height={barcodeHeight} 
+                                         fontSize={Math.max(5, Math.round(7 * qrScale))} 
+                                         textPosition="bottom" 
+                                         margin={0} 
+                                         background="transparent" 
+                                         lineColor="#000000" 
+                                         displayValue={true} 
+                                         renderer="svg"
+                                         format="CODE128"
+                                       />
+                                   </div>
+                                 )}
+                             </div>
+                             
+                             {hasDetailsUnder && (
+                               <div 
+                                 className="w-full mt-1 border-t border-black/10 pt-1 text-left font-mono leading-tight space-y-0.5"
+                                 style={{ fontSize: `${Math.max(5, Math.round(8 * qrScale))}px` }}
+                               >
+                                   {showCategory && <div className="truncate opacity-80 uppercase">CAT: {item.category}</div>}
+                                   {showSerial && item.serial !== '-' && <div className="truncate opacity-80 uppercase">SN: {item.serial}</div>}
+                                   {showPopor && item.popor !== '-' && <div className="truncate opacity-80 uppercase text-emerald-800 font-extrabold">PO: {item.popor}</div>}
+                               </div>
+                             )}
+
+                             {showMetaFooter && (
+                               <div 
+                                 className="w-full text-right font-mono opacity-50 mt-1 uppercase"
+                                 style={{ fontSize: `${Math.max(4, Math.round(6 * qrScale))}px` }}
+                               >
+                                 ASET LAPANGAN • LOGISTIK
+                               </div>
+                             )}
+                           </div>
+                         );
+                      })}
                 </div>
             )}
 
-            {/* Print Type: Barcode Roll */}
-            {printContext.type === 'barcode-roll' && (
-                <div className="flex flex-col m-0 p-0 items-center gap-4">
-                    {inventory
-                      .filter(i => printContext.ids.includes(i.id))
-                      .sort((a, b) => a.id.localeCompare(b.id, undefined, { numeric: true, sensitivity: 'base' }))
-                      .map((item, index) => (
-                        <div key={item.id} style={{ pageBreakAfter: 'always', breakAfter: 'always', width: '100%', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: '12px 0', boxSizing: 'border-box' }} className="barcode-roll-label">
+            {(printContext.type === 'barcode-roll' || printContext.type === 'custom-label-roll') && (
+                <div className="block m-0 p-0 text-center">
+                    {(printContext.type === 'custom-label-roll'
+                      ? Array.from({ length: printContext.quantity || 1 }).map((_, i) => ({
+                          id: (printContext.data.id || 'CUST') + (printContext.quantity > 1 ? `-${i}` : ''),
+                          name: printContext.data.name || 'LABEL CUSTOM',
+                          serial: printContext.data.serial || '-',
+                          category: printContext.data.category || '',
+                          sku: printContext.data.sku || '',
+                          popor: printContext.data.popor || '',
+                          note: ''
+                        }))
+                      : inventory
+                          .filter(i => printContext.ids.includes(i.id))
+                          .sort((a, b) => a.id.localeCompare(b.id, undefined, { numeric: true, sensitivity: 'base' }))
+                    ).map((item, index) => (
+                        <div key={`${item.id}_${index}`} style={{ pageBreakAfter: 'always', breakAfter: 'always', width: '100%', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: '12px 0', boxSizing: 'border-box' }} className="barcode-roll-label">
                             <div className="font-black uppercase text-[15px] print:text-[18px] leading-tight text-center max-w-[90%] truncate">{item.name}</div>
                             {item.serial && <div className="font-bold text-[9px] print:text-[11px] leading-tight text-center mb-1 max-w-[90%] truncate text-slate-700">SN: {item.serial}</div>}
                             
@@ -1471,16 +2145,33 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
 
              {/* Print Type: Logs History */}
             {printContext.type.startsWith('logs-') && (() => {
+                const timeframe = printContext.timeframe || (printContext.type === 'logs-yesterday' ? 'yesterday' : 'today');
+                const now = Date.now();
+                
                 const filteredLogs = logs.filter(l => {
-                    if (printContext.type === 'logs-today') return l.fullDate === new Date().toLocaleDateString('id-ID');
-                    const y = new Date(); y.setDate(y.getDate() - 1);
-                    return l.fullDate === y.toLocaleDateString('id-ID');
+                    if (!l) return false;
+                    
+                    if (timeframe === 'today') {
+                        return l.fullDate === new Date().toLocaleDateString('id-ID');
+                    } else if (timeframe === 'yesterday') {
+                        const y = new Date(); y.setDate(y.getDate() - 1);
+                        return l.fullDate === y.toLocaleDateString('id-ID');
+                    } else if (timeframe === '1_minggu') {
+                        return (now - (l.timestamp || 0)) <= 7 * 24 * 3600 * 1000;
+                    } else if (timeframe === '2_minggu') {
+                        return (now - (l.timestamp || 0)) <= 14 * 24 * 3600 * 1000;
+                    } else if (timeframe === '3_minggu') {
+                        return (now - (l.timestamp || 0)) <= 21 * 24 * 3600 * 1000;
+                    } else if (timeframe === 'semua_waktu') {
+                        return true;
+                    }
+                    return false;
                 });
                 
                 const sortedFilteredLogs = [...filteredLogs].sort((a, b) => b.timestamp - a.timestamp);
                 const latestLogMap = new Map();
                 sortedFilteredLogs.forEach(log => {
-                    if (!latestLogMap.has(log.id)) {
+                    if (log && log.id && !latestLogMap.has(log.id)) {
                         latestLogMap.set(log.id, log);
                     }
                 });
@@ -1489,106 +2180,202 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                 const logsInsideOrOther = [];
                 
                 filteredLogs.forEach(log => {
+                    if (!log || !log.id) return;
                     const latestLog = latestLogMap.get(log.id);
                     const currentItem = inventory.find(i => i.id === log.id);
                     const isCurrentlyOut = currentItem && currentItem.status === 'Keluar';
                     
-                    if (isCurrentlyOut && log.timestamp === latestLog.timestamp && log.type === 'OUT') {
+                    if (isCurrentlyOut && latestLog && log.timestamp === latestLog.timestamp && log.type === 'OUT') {
                         logsStillOut.push(log);
                     } else {
                         logsInsideOrOther.push(log);
                     }
                 });
 
+                const sortMultiplier = (printContext.sort === 'asc') ? 1 : -1;
+                const sortedLogsStillOut = [...logsStillOut].sort((a, b) => (a.timestamp - b.timestamp) * sortMultiplier);
+                const sortedLogsInsideOrOther = [...logsInsideOrOther].sort((a, b) => (a.timestamp - b.timestamp) * sortMultiplier);
+
                 return (
                 <div className="animate-in fade-in slide-in-from-bottom-4 duration-500">
-                   <h2 className="text-sm font-black uppercase mb-1 py-1 border-b-[1.5px] border-black border-dotted print:mt-[-10px]">
-                     LAPORAN MUTASI ASET - {
-                        printContext.type === 'logs-today' ? "HARI INI (" + new Date().toLocaleDateString('id-ID') + ")" :
-                        "KEMARIN (" + (() => { const d = new Date(); d.setDate(d.getDate()-1); return d.toLocaleDateString('id-ID'); })() + ")"
-                     }
-                   </h2>
+                    <h2 className="text-xs font-black uppercase mb-1 py-1 border-b-[1.5px] border-black border-dotted print:mt-[-15px] print:mb-2 text-slate-900">
+                      LAPORAN MUTASI ASET - {
+                        (() => {
+                          if (timeframe === 'today') return "HARI INI (" + new Date().toLocaleDateString('id-ID') + ")";
+                          if (timeframe === 'yesterday') {
+                            const d = new Date(); d.setDate(d.getDate()-1);
+                            return "KEMARIN (" + d.toLocaleDateString('id-ID') + ")";
+                          }
+                          if (timeframe === '1_minggu') return "1 MINGGU TERAKHIR";
+                          if (timeframe === '2_minggu') return "2 MINGGU TERAKHIR";
+                          if (timeframe === '3_minggu') return "3 MINGGU TERAKHIR";
+                          return "SEMUA RIWAYAT TRANSAKSI";
+                        })()
+                      } ({printContext.sort === 'asc' ? 'TERLAMA KE TERBARU' : 'TERBARU KE TERLAMA'})
+                    </h2>
 
-                   <h3 className="text-[10px] font-black uppercase mt-4 mb-2 text-red-600">BAGIAN 1: ASET YANG MASIH DI LUAR GUDANG (BELUM KEMBALI / MERAH)</h3>
-                   <table className="w-full text-left text-[7px] print:text-[8px] leading-tight mb-6 border-collapse">
-                     <thead className="border-b-[1.5px] border-black font-black bg-red-50">
-                       <tr>
-                         <th className="py-1 px-1">WAKTU</th>
-                         <th className="py-1 px-1">TIPE</th>
-                         <th className="py-1 px-1">SKU</th>
-                         <th className="py-1 px-1">NAMA ASET</th>
-                         <th className="py-1 px-1">STATUS SEKARANG</th>
-                         <th className="py-1 px-1">PEMEGANG SAAT INI</th>
-                         <th className="py-1 px-1">OP</th>
-                       </tr>
-                     </thead>
-                     <tbody className="divide-y divide-black/20 font-mono">
-                       {logsStillOut.map(log => (
-                         <tr key={log.timestamp} className="break-inside-avoid text-red-600 print:text-red-700 font-bold bg-red-50/30">
-                           <td className="py-1 px-1 whitespace-nowrap">{log.time}</td>
-                           <td className="py-1 px-1">
-                              {log.type === 'IN' && <span className="font-black border border-current px-0.5 py-px">IN</span>}
-                              {log.type === 'OUT' && <span className="font-black border border-current px-0.5 py-px border-dashed">OUT</span>}
-                              {log.type === 'ADD' && <span className="font-black">ADD</span>}
-                              {log.type === 'DELETE' && <span className="font-black line-through">DEL</span>}
-                              {log.type === 'EDIT' && <span className="font-black underline border-dotted border-current">EDIT</span>}
-                           </td>
-                           <td className="py-1 px-1">{log.id}</td>
-                           <td className="py-1 px-1 font-black">{log.name}</td>
-                           <td className="py-1 px-1 uppercase">{log.status}</td>
-                           <td className="py-1 px-1 truncate max-w-[150px]">{log.holder || '-'}</td>
-                           <td className="py-1 px-1">{log.operator}</td>
-                         </tr>
-                       ))}
-                       {logsStillOut.length === 0 && (
-                          <tr><td colSpan={7} className="text-center py-4 font-bold border-b border-black text-slate-500">SELURUH ASET YANG KELUAR SUDAH KEMBALI KE GUDANG.</td></tr>
-                       )}
-                     </tbody>
-                   </table>
+                    <h3 className="text-[9px] print:text-[8px] font-black uppercase mt-2 mb-1 text-red-600 tracking-wider">BAGIAN 1: ASET YANG MASIH DI LUAR GUDANG (BELUM KEMBALI / MERAH)</h3>
+                    <table className="w-full text-left text-[7px] print:text-[8px] leading-tight mb-3 print:mb-2 border-collapse">
+                      <thead className="border-b-[1.5px] border-black font-black bg-red-50">
+                        <tr>
+                          <th className="py-1 px-1 print:py-0.5">WAKTU</th>
+                          <th className="py-1 px-1 print:py-0.5 whitespace-nowrap">TIPE</th>
+                          <th className="py-1 px-1 print:py-0.5">SKU / ID</th>
+                          <th className="py-1 px-1 print:py-0.5">KATEGORI</th>
+                          <th className="py-1 px-1 print:py-0.5">NAMA ASET</th>
+                          <th className="py-1 px-1 print:py-0.5">NO. POPOR</th>
+                          <th className="py-1 px-1 print:py-0.5">NO. SERI</th>
+                          <th className="py-1 px-1 print:py-0.5">STATUS</th>
+                          <th className="py-1 px-1 print:py-0.5">PEMEGANG SAAT INI</th>
+                          <th className="py-1 px-1 print:py-0.5">OP</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-black/20 font-mono">
+                        {sortedLogsStillOut.map(log => {
+                          const itemInfo = inventory.find(i => i.id === log.id);
+                          return (
+                          <tr key={log.timestamp} className="break-inside-avoid text-red-600 print:text-red-700 font-bold bg-red-50/30">
+                            <td className="py-1 px-1 print:py-0.5 whitespace-nowrap">{log.time}</td>
+                            <td className="py-1 px-1 print:py-0.5">
+                               {log.type === 'IN' && <span className="font-black border border-current px-0.5 py-px">IN</span>}
+                               {log.type === 'OUT' && <span className="font-black border border-current px-0.5 py-px border-dashed">OUT</span>}
+                               {log.type === 'ADD' && <span className="font-black">ADD</span>}
+                               {log.type === 'DELETE' && <span className="font-black line-through">DEL</span>}
+                               {log.type === 'EDIT' && <span className="font-black underline border-dotted border-current">EDIT</span>}
+                            </td>
+                            <td className="py-1 px-1 print:py-0.5">{log.id}</td>
+                            <td className="py-1 px-1 print:py-0.5 uppercase">{itemInfo?.category || '-'}</td>
+                            <td className="py-1 px-1 print:py-0.5 font-black">{log.name}</td>
+                            <td className="py-1 px-1 print:py-0.5 font-black">{itemInfo?.popor || '-'}</td>
+                            <td className="py-1 px-1 print:py-0.5">{itemInfo?.serial || '-'}</td>
+                            <td className="py-1 px-1 print:py-0.5 uppercase">{log.status}</td>
+                            <td className="py-1 px-1 print:py-0.5 truncate max-w-[150px]">{log.holder || '-'}</td>
+                            <td className="py-1 px-1 print:py-0.5">{log.operator}</td>
+                          </tr>
+                          );
+                        })}
+                        {sortedLogsStillOut.length === 0 && (
+                           <tr><td colSpan={10} className="text-center py-2 font-bold border-b border-black text-slate-500 text-[8px] print:text-[8px]">SELURUH ASET YANG KELUAR SUDAH KEMBALI KE GUDANG.</td></tr>
+                        )}
+                      </tbody>
+                    </table>
 
-                   <h3 className="text-[10px] font-black uppercase mt-4 mb-2 text-slate-800">BAGIAN 2: RIWAYAT MUTASI / ASET YANG SUDAH KEMBALI</h3>
-                   <table className="w-full text-left text-[7px] print:text-[8px] leading-tight border-collapse">
-                     <thead className="border-b-[1.5px] border-black font-black bg-slate-50">
-                       <tr>
-                         <th className="py-1 px-1">WAKTU</th>
-                         <th className="py-1 px-1">TIPE</th>
-                         <th className="py-1 px-1">SKU</th>
-                         <th className="py-1 px-1">NAMA ASET</th>
-                         <th className="py-1 px-1">STATUS LOG</th>
-                         <th className="py-1 px-1">KETERANGAN</th>
-                         <th className="py-1 px-1">OP</th>
-                       </tr>
-                     </thead>
-                     <tbody className="divide-y divide-black/20 font-mono text-black font-medium">
-                       {logsInsideOrOther.map(log => (
-                         <tr key={log.timestamp} className="break-inside-avoid">
-                           <td className="py-0.5 px-1 whitespace-nowrap">{log.time}</td>
-                           <td className="py-0.5 px-1">
-                              {log.type === 'IN' && <span className="font-black border border-black px-0.5 py-px bg-gray-100 uppercase">IN</span>}
-                              {log.type === 'OUT' && <span className="font-black border border-black px-0.5 py-px bg-gray-100 border-dashed uppercase">OUT</span>}
-                              {log.type === 'ADD' && <span className="font-black uppercase">ADD</span>}
-                              {log.type === 'DELETE' && <span className="font-black line-through uppercase">DEL</span>}
-                              {log.type === 'EDIT' && <span className="font-black border border-black px-0.5 py-px bg-gray-100 border-dotted uppercase">EDIT</span>}
-                           </td>
-                           <td className="py-0.5 px-1">{log.id}</td>
-                           <td className="py-0.5 px-1 font-black">{log.name}</td>
-                           <td className="py-0.5 px-1 uppercase">{log.status}</td>
-                           <td className="py-0.5 px-1 truncate max-w-[150px]">{log.holder || '-'}</td>
-                           <td className="py-0.5 px-1">{log.operator}</td>
-                         </tr>
-                       ))}
-                       {logsInsideOrOther.length === 0 && (
-                            <tr><td colSpan={7} className="text-center py-4 font-bold border-b border-black">TIDAK ADA DATA LOG MUTASI LAINNYA.</td></tr>
-                       )}
-                     </tbody>
-                   </table>
-                   
-                   <div className="mt-16 flex justify-end">
-                       <div className="text-center w-48">
-                           <p className="text-xs font-bold mb-16">Pengesahan / Mengetahui</p>
-                           <p className="border-t border-black pt-1 font-bold">KEPALA GUDANG</p>
-                       </div>
-                   </div>
+                     <h3 className="text-[9px] print:text-[8px] font-black uppercase mt-3 mb-1 text-slate-800 tracking-wider">BAGIAN 2: RIWAYAT MUTASI / ASET YANG SUDAH KEMBALI</h3>
+                    <table className="w-full text-left text-[7px] print:text-[8px] leading-tight border-collapse">
+                      <thead className="border-b-[1.5px] border-black font-black bg-slate-50">
+                        <tr>
+                          <th className="py-1 px-1 print:py-0.5">WAKTU</th>
+                          <th className="py-1 px-1 print:py-0.5 whitespace-nowrap">TIPE</th>
+                          <th className="py-1 px-1 print:py-0.5">SKU / ID</th>
+                          <th className="py-1 px-1 print:py-0.5">KATEGORI</th>
+                          <th className="py-1 px-1 print:py-0.5">NAMA ASET</th>
+                          <th className="py-1 px-1 print:py-0.5">NO. POPOR</th>
+                          <th className="py-1 px-1 print:py-0.5">NO. SERI</th>
+                          <th className="py-1 px-1 print:py-0.5">STATUS LOG</th>
+                          <th className="py-1 px-1 print:py-0.5">PEMEGANG / KET</th>
+                          <th className="py-1 px-1 print:py-0.5">OP</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-black/20 font-mono text-black font-medium">
+                        {sortedLogsInsideOrOther.map(log => {
+                          const itemInfo = inventory.find(i => i.id === log.id);
+                          return (
+                          <tr key={log.timestamp} className="break-inside-avoid">
+                            <td className="py-0.5 px-1 print:py-0.5 whitespace-nowrap">{log.time}</td>
+                            <td className="py-0.5 px-1 print:py-0.5">
+                               {log.type === 'IN' && <span className="font-black border border-black px-0.5 py-px bg-gray-100 uppercase">IN</span>}
+                               {log.type === 'OUT' && <span className="font-black border border-black px-0.5 py-px bg-gray-100 border-dashed uppercase">OUT</span>}
+                               {log.type === 'ADD' && <span className="font-black uppercase">ADD</span>}
+                               {log.type === 'DELETE' && <span className="font-black line-through uppercase">DEL</span>}
+                               {log.type === 'EDIT' && <span className="font-black border border-black px-0.5 py-px bg-gray-100 border-dotted uppercase">EDIT</span>}
+                            </td>
+                            <td className="py-0.5 px-1 print:py-0.5">{log.id}</td>
+                            <td className="py-0.5 px-1 print:py-0.5 uppercase text-slate-600">{itemInfo?.category || '-'}</td>
+                            <td className="py-0.5 px-1 print:py-0.5 font-black">{log.name}</td>
+                            <td className="py-0.5 px-1 print:py-0.5 font-bold text-slate-800">{itemInfo?.popor || '-'}</td>
+                            <td className="py-0.5 px-1 print:py-0.5 text-slate-600">{itemInfo?.serial || '-'}</td>
+                            <td className="py-0.5 px-1 print:py-0.5 uppercase">{log.status}</td>
+                            <td className="py-0.5 px-1 print:py-0.5 truncate max-w-[150px]">{log.holder || '-'}</td>
+                            <td className="py-0.5 px-1 print:py-0.5">{log.operator}</td>
+                          </tr>
+                          );
+                        })}
+                        {sortedLogsInsideOrOther.length === 0 && (
+                             <tr><td colSpan={10} className="text-center py-2 font-bold border-b border-black text-slate-500 text-[8px] print:text-[8px]">TIDAK ADA DATA LOG MUTASI LAINNYA.</td></tr>
+                        )}
+                      </tbody>
+                    </table>
+                    
+                    <div className="mt-8 print:mt-4 flex justify-end break-inside-avoid" style={{ pageBreakInside: 'avoid' }}>
+                        <div className="text-center w-48">
+                            <p className="text-xs print:text-[10px] font-bold mb-12 print:mb-8">Pengesahan / Mengetahui</p>
+                            <p className="border-t border-black pt-1 font-bold text-xs print:text-[10px]">KEPALA GUDANG</p>
+                        </div>
+                    </div>
+                </div>
+                );
+            })()}
+
+            {/* Print Type: Assets Currently Out of Warehouse */}
+            {printContext.type === 'assets-out' && (() => {
+                const assetsOut = inventory
+                  .filter(i => i.status === 'Keluar')
+                  .sort((a, b) => {
+                     const tA = a.outTimestamp || 0;
+                     const tB = b.outTimestamp || 0;
+                     return tB - tA; // Newest out first
+                  });
+
+                return (
+                <div className="animate-in fade-in duration-500 p-4 print:p-0">
+                    <h2 className="text-xs font-black uppercase mb-1 py-1 border-b-[1.5px] border-black border-dotted print:mt-[-15px] print:mb-2 text-slate-900">
+                      LAPORAN DAFTAR ASET SEKARANG DI LUAR GUDANG (BELUM KEMBALI)
+                    </h2>
+                    <p className="text-[10px] text-slate-600 mb-4 uppercase font-bold font-mono">
+                      TOTAL AKTIF DI LUAR: {assetsOut.length} BARANG/SENJATA
+                    </p>
+
+                    <table className="w-full text-left text-[7px] print:text-[8px] leading-tight border-collapse">
+                      <thead className="border-b-[1.5px] border-black font-black bg-amber-50">
+                        <tr>
+                          <th className="py-1 px-1.5 text-center">NO</th>
+                          <th className="py-1 px-1.5">SKU / ID</th>
+                          <th className="py-1 px-1.5">NAMA ASET</th>
+                          <th className="py-1 px-1.5">KATEGORI</th>
+                          <th className="py-1 px-1.5 text-center">NO. POPOR</th>
+                          <th className="py-1 px-1.5">NO. SERI</th>
+                          <th className="py-1 px-1.5">PEMEGANG / PEMINJAM</th>
+                          <th className="py-1 px-1.5 text-center">WAKTU DIKELUARKAN</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-black/20 font-mono text-black font-medium">
+                        {assetsOut.map((item, idx) => {
+                          const outDate = item.outTimestamp ? new Date(item.outTimestamp).toLocaleString('id-ID') : '-';
+                          return (
+                            <tr key={item.id} className="break-inside-avoid">
+                              <td className="py-1 px-1.5 text-center font-bold">{idx + 1}</td>
+                              <td className="py-1 px-1.5 font-bold text-amber-600">{item.id}</td>
+                              <td className="py-1 px-1.5 font-black uppercase">{item.name}</td>
+                              <td className="py-1 px-1.5 uppercase">{item.category}</td>
+                              <td className="py-1 px-1.5 text-center font-black">{item.popor || '-'}</td>
+                              <td className="py-1 px-1.5">{item.serial || '-'}</td>
+                              <td className="py-1 px-1.5 font-black text-amber-700 uppercase">{item.holder || '-'}</td>
+                              <td className="py-1 px-1.5 text-center whitespace-nowrap">{outDate}</td>
+                            </tr>
+                          );
+                        })}
+                        {assetsOut.length === 0 && (
+                           <tr><td colSpan={8} className="text-center py-4 font-bold border-b border-black text-slate-500 text-[8px] uppercase">GUDANG AMAN, SELURUH ASET BERADA DI DALAM GUDANG.</td></tr>
+                        )}
+                      </tbody>
+                    </table>
+                    
+                    <div className="mt-8 print:mt-4 flex justify-end break-inside-avoid" style={{ pageBreakInside: 'avoid' }}>
+                        <div className="text-center w-48">
+                            <p className="text-xs print:text-[10px] font-bold mb-12 print:mb-8">Pengesahan / Mengetahui</p>
+                            <p className="border-t border-black pt-1 font-bold text-xs print:text-[10px]">KEPALA GUDANG</p>
+                        </div>
+                    </div>
                 </div>
                 );
             })()}
@@ -1664,6 +2451,9 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
           <button onClick={() => { setActiveTab('opname'); setIsMobileMenuOpen(false); }} className={`sidebar-item btn-interact w-full flex items-center gap-4 px-5 py-4 rounded-2xl border transition-all ${activeTab === 'opname' ? 'bg-emerald-50 dark:bg-emerald-950/30 border-emerald-100 dark:border-emerald-900/50 shadow-sm text-emerald-600 dark:text-emerald-400' : 'border-transparent text-slate-600 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-800/40 hover:text-slate-900 dark:hover:text-slate-200'}`}>
             <ClipboardCheck size={20} /><span className="font-bold text-sm">Stock Opname</span>
           </button>
+          <button onClick={() => { setActiveTab('labelgen'); setIsMobileMenuOpen(false); }} className={`sidebar-item btn-interact w-full flex items-center gap-4 px-5 py-4 rounded-2xl border transition-all ${activeTab === 'labelgen' ? 'bg-emerald-50 dark:bg-emerald-950/30 border-emerald-100 dark:border-emerald-900/50 shadow-sm text-emerald-600 dark:text-emerald-400' : 'border-transparent text-slate-600 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-800/40 hover:text-slate-900 dark:hover:text-slate-200'}`}>
+            <Printer size={20} /><span className="font-bold text-sm">Label Generator</span>
+          </button>
           <button onClick={() => { setActiveTab('leaderboard'); setIsMobileMenuOpen(false); }} className={`sidebar-item btn-interact w-full flex items-center gap-4 px-5 py-4 rounded-2xl border transition-all ${activeTab === 'leaderboard' ? 'bg-emerald-50 dark:bg-emerald-950/30 border-emerald-100 dark:border-emerald-900/50 shadow-sm text-emerald-600 dark:text-emerald-400' : 'border-transparent text-slate-600 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-800/40 hover:text-slate-900 dark:hover:text-slate-200'}`}>
             <LayoutDashboard size={20} /><span className="font-bold text-sm">Papan Kinerja</span>
           </button>
@@ -1710,9 +2500,23 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
               </div>
               <button 
                 onClick={() => setAutoLogout(!autoLogout)} 
-                className={`btn-interact text-[9px] ${autoLogout ? 'bg-emerald-950/40 text-emerald-500 hover:text-slate-900 dark:text-white border-emerald-900/50' : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:text-white border-slate-300 dark:border-slate-700'} px-3 py-1.5 rounded-lg border font-bold uppercase tracking-widest transition-colors`}
+                className={`btn-interact text-[9px] ${autoLogout ? 'bg-emerald-950/40 text-emerald-500 hover:text-slate-900 dark:hover:text-white border-emerald-900/50' : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white border-slate-300 dark:border-slate-700'} px-3 py-1.5 rounded-lg border font-bold uppercase tracking-widest transition-colors`}
               >
-                {autoLogout ? 'OFF-KAN' : 'ON-KAN'}
+                {autoLogout ? 'MATIKAN' : 'HIDUPKAN'}
+              </button>
+            </div>
+            <div className="mt-2 bg-slate-50 dark:bg-[#020617] border border-slate-200 dark:border-slate-800 rounded-xl p-3 flex justify-between items-center">
+              <div className="text-left">
+                <p className="text-[8px] font-black text-slate-600 dark:text-slate-400 uppercase tracking-widest">Efek Visual & Animasi</p>
+                <p className={`text-[10px] font-mono font-bold mt-0.5 truncate max-w-[120px] ${!perfMode ? 'text-emerald-500' : 'text-amber-500'}`}>
+                  {!perfMode ? 'BERAT (KUALITAS)' : 'RINGAN (PERFORMA)'}
+                </p>
+              </div>
+              <button 
+                onClick={togglePerfMode} 
+                className={`btn-interact shrink-0 text-[8px] ${!perfMode ? 'bg-amber-950/40 text-amber-500 hover:text-amber-400 border-amber-900/50' : 'bg-emerald-950/40 text-emerald-500 hover:text-emerald-400 border-emerald-900/50'} px-3 py-1.5 rounded-lg border font-bold uppercase tracking-widest transition-colors`}
+              >
+                {!perfMode ? 'MODE RINGAN' : 'AKTIFKAN EFEK'}
               </button>
             </div>
 
@@ -1768,6 +2572,102 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
            </div>
         </div>
          <div className="flex-1 overflow-y-auto px-4 md:px-6 pt-6 pb-12 custom-scrollbar">
+          {syncQueue.length > 0 && (
+             <div className="max-w-7xl mx-auto mb-6 bg-slate-50 dark:bg-slate-900/40 border border-amber-500/30 dark:border-amber-500/20 p-5 rounded-2xl shadow-xl animate-in duration-300 slide-in-from-top-6 flex flex-col lg:flex-row lg:items-center justify-between gap-6">
+                <div className="flex items-start gap-4">
+                   <div className="p-3 bg-amber-500/10 text-amber-600 dark:text-amber-400 rounded-xl border border-amber-500/20 shrink-0">
+                      <svg className={`h-6 w-6 ${isSyncingQueue ? 'animate-spin' : 'animate-pulse'}`} fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 4.79M9 11v5l3 3m6-8h-5.582"></path>
+                      </svg>
+                   </div>
+                   <div className="space-y-1 col-span-3">
+                      <div className="flex items-center gap-2">
+                         <h3 className="font-bold text-slate-800 dark:text-slate-100 tracking-tight text-base">Antrean Sinkronisasi Aktif (Offline)</h3>
+                         <span className="px-2 py-0.5 text-[10px] uppercase font-mono font-bold bg-amber-500/10 text-amber-600 dark:text-amber-450 border border-amber-500/20 rounded-full">
+                            {syncQueue.length} Mutasi Tertunda
+                         </span>
+                      </div>
+                      <p className="text-xs text-slate-600 dark:text-slate-400 leading-relaxed max-w-2xl">
+                         Mutasi aset di atas diproses saat koneksi internet terputus. Sistem mengamankannya di penyimpanan lokal. {isOnline ? "Koneksi terdeteksi aktif, sistem siap menyinkronkan data!" : "Data akan otomatis diunggah ketika perangkat Anda memperoleh akses internet kembali."}
+                      </p>
+                      
+                      {/* Collapsible details of mutations */}
+                      <div className="mt-3 pt-3 border-t border-slate-200 dark:border-slate-800 flex flex-wrap gap-2 max-h-32 overflow-y-auto custom-scrollbar">
+                         {syncQueue.slice(0, 10).map((task) => {
+                            let typeLabel = "Mutasi";
+                            let colorClass = "bg-blue-500/10 text-blue-600 dark:bg-blue-500/5 dark:text-blue-400 border border-blue-500/20";
+                            let details = "";
+                            
+                            if (task.action === 'ADD') {
+                               typeLabel = "Tambah";
+                               colorClass = "bg-green-500/10 text-green-600 dark:bg-green-500/5 dark:text-green-400 border border-green-500/20";
+                               details = `${task.item?.id || task.itemId || 'Aset'} - ${task.item?.name || ''}`;
+                            } else if (task.action === 'EDIT') {
+                               typeLabel = "Edit";
+                               colorClass = "bg-amber-500/10 text-amber-600 dark:bg-amber-500/5 dark:text-amber-400 border border-amber-500/20";
+                               details = `${task.item?.id || task.itemId || 'Aset'} - ${task.item?.name || ''}`;
+                            } else if (task.action === 'DELETE') {
+                               typeLabel = "Hapus";
+                               colorClass = "bg-red-500/10 text-red-600 dark:bg-red-500/5 dark:text-red-400 border border-red-500/20";
+                               details = `${task.itemId || 'Aset'}`;
+                            } else if (task.action === 'MUTATION') {
+                               typeLabel = task.log?.type === 'OUT' ? "Keluar" : "Kembali";
+                               colorClass = task.log?.type === 'OUT' ? "bg-rose-500/10 text-rose-600 dark:bg-rose-500/5 dark:text-rose-400 border border-rose-500/20" : "bg-emerald-500/10 text-emerald-600 dark:bg-emerald-500/5 dark:text-emerald-400 border border-emerald-500/20";
+                               details = `${task.item?.id || task.itemId || 'Aset'} (${task.log?.holder || 'Lokal'})`;
+                            }
+                            
+                            return (
+                               <div key={task.id} className={`flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-mono rounded-lg ${colorClass}`}>
+                                  <span className="font-extrabold uppercase text-[9px]">{typeLabel}</span>
+                                  <span className="opacity-40">|</span>
+                                  <span className="font-medium truncate max-w-[180px]">{details}</span>
+                               </div>
+                            );
+                         })}
+                         {syncQueue.length > 10 && (
+                            <div className="flex items-center text-[10px] text-slate-500 font-mono pl-1">
+                               + {syncQueue.length - 10} mutasi lainnya...
+                            </div>
+                         )}
+                      </div>
+                   </div>
+                </div>
+                
+                <div className="shrink-0 flex sm:flex-col items-stretch lg:items-end gap-2 w-full lg:w-auto">
+                   <button
+                      onClick={processSyncQueue}
+                      disabled={!isOnline || isSyncingQueue}
+                      className={`px-5 py-2.5 text-xs font-bold rounded-xl transition-all border shadow-sm flex items-center justify-center gap-2 select-none ${
+                        isOnline && !isSyncingQueue
+                          ? 'bg-amber-500 hover:bg-amber-600 border-amber-600 dark:border-amber-500 text-white cursor-pointer active:scale-95'
+                          : 'bg-slate-100 dark:bg-slate-800 text-slate-400 dark:text-slate-500 border-slate-205 dark:border-slate-700 cursor-not-allowed'
+                      }`}
+                   >
+                      {isSyncingQueue ? (
+                         <>
+                            <svg className="animate-spin h-3.5 w-3.5" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                               <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                               <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                            </svg>
+                            <span>Mengunggah...</span>
+                         </>
+                      ) : (
+                         <>
+                            <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M11.93 11.93a4.5 4.5 0 11-6.36-6.36m6.36 6.36l6.36 6.36M15 15a4.5 4.5 0 11-6.36-6.36m6.36 6.36L21 21M3 21h18"></path>
+                            </svg>
+                            <span>Lakukan Sinkronisasi</span>
+                         </>
+                      )}
+                   </button>
+                   <div className="text-[10px] text-center lg:text-right text-slate-500 font-mono tracking-tight flex items-center justify-center lg:justify-end gap-1 px-1">
+                      <span>Status Jaringan:</span>
+                      <span className={`inline-block w-2 h-2 rounded-full ${isOnline ? 'bg-emerald-500' : 'bg-rose-500'}`} />
+                      <span className="font-bold">{isOnline ? 'ONLINE' : 'OFFLINE'}</span>
+                   </div>
+                </div>
+             </div>
+          )}
           <AnimatePresence mode="wait">
             <motion.div
               key={activeTab}
@@ -1779,6 +2679,40 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
             >
         {activeTab === 'dashboard' && (
            <div className="max-w-7xl mx-auto space-y-6 animate-in fade-in">
+              {/* Sync Controls at Top of Dashboard */}
+              <div className="flex flex-col md:flex-row gap-4 items-stretch md:items-center justify-between bg-white dark:bg-[#050b14]/95 backdrop-blur-xl border border-slate-200 dark:border-slate-800 p-4 md:p-6 rounded-[30px] shadow-sm">
+                <div>
+                   <h2 className="text-xl md:text-2xl font-black text-slate-900 dark:text-white uppercase italic flex items-center gap-3">
+                      <LayoutDashboard className="text-emerald-500" size={24} /> 
+                      <span className="text-emerald-500/50 mr-1">[</span>Sistem Inti<span className="text-emerald-500/50 ml-1">]</span>
+                   </h2>
+                   <p className="text-[10px] sm:text-xs text-slate-500 dark:text-slate-400 mt-1 uppercase font-black tracking-widest">Pusat Komando Operasional</p>
+                </div>
+                
+                {sheetsSpreadsheetId && (
+                   <div className="flex items-center gap-2 bg-slate-50 dark:bg-[#020617] border border-slate-200 dark:border-slate-800 p-2 pr-4 rounded-2xl shadow-inner dark:shadow-none min-w-[280px]">
+                      <div className="flex items-center justify-center w-12 h-12 bg-emerald-100 dark:bg-emerald-950/40 rounded-xl border border-emerald-200 dark:border-emerald-900/50 flex-shrink-0">
+                         <Cloud className="text-emerald-600 dark:text-emerald-500" size={20} />
+                      </div>
+                      <div className="flex flex-col flex-1 mr-4 overflow-hidden">
+                         <p className="text-[9px] font-black uppercase tracking-[0.2em] text-slate-500 dark:text-slate-400">Google Sheets Sync</p>
+                         <p className="text-[11px] font-bold text-slate-900 dark:text-white flex items-center gap-1.5 mt-0.5 truncate shrink-0">
+                            <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${isSheetsSyncing ? 'bg-amber-500 animate-pulse' : 'bg-emerald-500'}`}></span>
+                            <span className="truncate">{isSheetsSyncing ? 'Mensinkronkan...' : 'Terhubung & Aktif'}</span>
+                         </p>
+                      </div>
+                      <button 
+                         onClick={handleSyncToSheets}
+                         disabled={isSheetsSyncing}
+                         className="btn-interact shrink-0 flex items-center justify-center w-10 h-10 bg-slate-800 hover:bg-slate-700 text-white dark:bg-emerald-900/30 dark:hover:bg-emerald-800/40 dark:text-emerald-400 rounded-xl transition-colors border border-slate-700 dark:border-emerald-900/50 cyber-cut"
+                         title="Force Sync"
+                      >
+                         <RefreshCw size={16} className={isSheetsSyncing ? "animate-spin" : ""} />
+                      </button>
+                   </div>
+                )}
+              </div>
+
              {/* Status Banner */}
              {(() => {
                 const outItems = inventory.filter(i => i.status === 'Keluar');
@@ -1954,7 +2888,7 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                      initial={{ opacity: 0, y: 20 }}
                      animate={{ opacity: 1, y: 0 }}
                      transition={{ duration: 0.4 }}
-                     className="relative z-0 group"
+                     className={`relative group ${widgetId === 'metrics' && dashboardListType ? 'z-50' : 'z-0'}`}
                    >
                       {widgetId === 'metrics' && (
                          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
@@ -1985,7 +2919,8 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                   <div className="w-16 h-16 bg-emerald-600/10 rounded-full flex items-center justify-center mx-auto mb-4 border-2 border-emerald-600/20 cyber-cut">
                     <ScanIcon size={32} className="text-emerald-500" />
                   </div>
-                  <p className="text-[10px] font-black text-slate-600 dark:text-slate-400 uppercase tracking-[0.3em]">[ SIAP MENERIMA INPUT SCANNER HARDWARE & MANUAL ]</p>
+                  <p className="text-[10px] font-black text-slate-600 dark:text-slate-400 uppercase tracking-[0.3em]">[ DETEKSI QR CODE & 1D BARCODE AKTIF ]</p>
+                  <p className="text-[9px] text-emerald-500 font-bold uppercase tracking-wider mt-1">Mendukung Scan QR Code, SKU Link URL, dan Barcode Inventaris</p>
               </div>
 
               {/* Manual Input Container */}
@@ -1994,7 +2929,22 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                   handleScanCode(scanInput);
                   setScanInput("");
               }}>
-                <div className="glass-effect rounded-[30px] border border-slate-300 dark:border-slate-700 p-2 focus-within:border-emerald-500 relative overflow-hidden bg-white dark:bg-[#020617] hud-card shadow-sm dark:shadow-none">
+                <div className={`glass-effect rounded-[30px] border border-slate-300 dark:border-slate-700 p-2 focus-within:border-emerald-500 relative overflow-hidden bg-white dark:bg-[#020617] hud-card shadow-sm dark:shadow-none transition-all duration-300 ${
+                  scanStatus === 'success_in' ? 'flash-success-in text-white' :
+                  scanStatus === 'success_out' ? 'flash-success-out text-white' :
+                  scanStatus === 'error' ? 'flash-error text-white' : ''
+                }`}>
+                    {scanStatus && (
+                      <div className={`absolute inset-0 z-50 flex flex-col items-center justify-center pointer-events-none transition-all duration-350 ${
+                        scanStatus === 'success_in' ? 'bg-emerald-600/90' :
+                        scanStatus === 'success_out' ? 'bg-blue-600/90' : 'bg-red-600/90'
+                      }`}>
+                        <div className="text-xs font-black uppercase tracking-[0.2em] mb-1 text-white text-center">
+                          {scanStatus === 'success_in' ? '✓ ASET DI GUDANG (CHECK-IN) SUKSES' :
+                           scanStatus === 'success_out' ? '⇗ ASET DIKELUARKAN (CHECK-OUT) SUKSES' : '✗ BARCODE / ID TIDAK DIKENAL'}
+                        </div>
+                      </div>
+                    )}
                     <div className="crt-scanline absolute inset-0 opacity-50 z-10 pointer-events-none"></div>
                     <input 
                       type="text" 
@@ -2009,21 +2959,14 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                         }
                       }}
                       className="w-full bg-white dark:bg-[#020617] p-8 rounded-[24px] text-xl font-mono font-bold text-emerald-500 dark:text-emerald-400 outline-none text-center uppercase tracking-widest relative z-20 shadow-sm dark:shadow-none" 
-                      placeholder="KETIK / SCAN BARCODE DI SINI..." 
+                      placeholder="KETIK / SCAN BARCODE ATAU QR CODE..." 
                     />
                 </div>
               </form>
 
-              {/* Holder Input Container */}
-              <div className="mt-4 flex flex-col sm:flex-row gap-4">
-                <input
-                  type="text"
-                  value={holderInput}
-                  onChange={(e) => setHolderInput(e.target.value)}
-                  placeholder="NAMA PEMBAWA ASET (PEMINJAMAN)"
-                  className="flex-1 bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 p-4 rounded-[16px] text-xs font-mono font-bold text-slate-700 dark:text-slate-300 outline-none uppercase tracking-widest text-center focus:border-emerald-500/50 transition-colors shadow-sm dark:shadow-none"
-                />
-                <div className="relative w-full sm:w-48 shrink-0">
+              {/* Alarm Setting Container (Borrower name box removed, synchronized with database) */}
+              <div className="mt-4 flex justify-center">
+                <div className="relative w-full max-w-xs">
                   <input
                     type="number"
                     min="1"
@@ -2037,7 +2980,7 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
               </div>
 
               {/* Advanced Scan Buttons */}
-              <div className="mt-8 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+              <div className="mt-8 grid grid-cols-1 sm:grid-cols-2 gap-4">
                    <div className="flex items-center justify-center gap-4 bg-slate-50 dark:bg-slate-900/40 p-3 rounded-xl border border-slate-200 dark:border-slate-800">
                       <label className="relative inline-flex items-center cursor-pointer">
                          <input type="checkbox" checked={rapidScan} onChange={(e) => setRapidScan(e.target.checked)} className="sr-only peer" />
@@ -2051,26 +2994,122 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                    >
                       <Camera size={18} className="group-hover:scale-110 transition-transform" /> AKTIFKAN KAMERA
                    </button>
-                   <button 
-                     onClick={() => handlePrint({ type: 'logs-today' })}
-                     className="flex items-center justify-center gap-2 bg-blue-50 dark:bg-blue-900/30 text-blue-600 dark:text-blue-500 border border-blue-200 dark:border-blue-900/50 px-6 py-4 rounded-xl text-[10px] font-black uppercase tracking-widest hover:bg-blue-100 dark:hover:bg-blue-900/50 transition-all shadow-sm dark:shadow-none btn-interact group sm:col-span-2 lg:col-span-1"
-                   >
-                      <Printer size={18} className="group-hover:scale-110 transition-transform" /> CETAK MUTASI HARI INI
-                   </button>
+              </div>
+
+              {/* FITUR CETAK LAPORAN & MUTASI */}
+              <div className="bg-slate-50/50 dark:bg-slate-900/20 border border-slate-200 dark:border-slate-800/80 rounded-[24px] p-5 space-y-4">
+                  <div className="flex items-center justify-between pb-3 border-b border-slate-200 dark:border-slate-800">
+                      <div className="flex items-center gap-2">
+                          <Printer size={16} className="text-blue-500" />
+                          <h3 className="text-[10px] font-black uppercase text-slate-800 dark:text-white tracking-[0.2em] font-sans">PANEL LAPORAN DAN CETAK MUTASI</h3>
+                      </div>
+                      <span className="text-[8px] font-mono bg-blue-500/10 text-blue-500 px-2.5 py-1 rounded-[6px] uppercase font-black tracking-widest">Ready</span>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      {/* Section 1: Cetak Mutasi Hari Ini */}
+                      <div className="bg-white dark:bg-[#020617]/40 p-4 rounded-xl border border-slate-200/60 dark:border-slate-800/60 flex flex-col justify-between space-y-3">
+                          <div>
+                              <p className="text-[9px] font-black text-slate-500 dark:text-slate-400 uppercase tracking-widest">1. FILTRASI JURNAL MUTASI</p>
+                              <p className="text-[8px] text-slate-400 dark:text-slate-500 uppercase font-semibold mt-1">Cetak riwayat keluar masuk dan log transaksi berdasarkan pilihan waktu.</p>
+                          </div>
+                          
+                          <div className="space-y-3 pt-1">
+                              {/* Dropdown Periode Waktu */}
+                              <div className="space-y-1">
+                                  <p className="text-[8px] font-black text-slate-500 dark:text-slate-400 uppercase tracking-wider">PERIODE LOG TRANSAKSI:</p>
+                                  <select 
+                                      value={todayPrintTimeframe}
+                                      onChange={(e) => setTodayPrintTimeframe(e.target.value)}
+                                      className="w-full bg-slate-100 dark:bg-slate-800/80 hover:bg-slate-200 dark:hover:bg-slate-700 border border-slate-200 dark:border-slate-700 text-[10px] font-mono font-bold text-slate-800 dark:text-slate-200 p-2 rounded-[8px] uppercase tracking-wider transition-colors outline-none cursor-pointer"
+                                  >
+                                      <option value="today">HARI INI (1 HARI)</option>
+                                      <option value="1_minggu">1 MINGGU TERAKHIR</option>
+                                      <option value="2_minggu">2 MINGGU TERAKHIR</option>
+                                      <option value="3_minggu">3 MINGGU TERAKHIR</option>
+                                      <option value="semua_waktu">SEMUA RIWAYAT (SEMUA WAKTU)</option>
+                                  </select>
+                              </div>
+
+                              <div className="flex items-center justify-between text-[8px] font-black uppercase text-slate-600 dark:text-slate-400">
+                                  <span>URUTAN WAKTU:</span>
+                                  <div className="flex gap-1.5">
+                                      <button 
+                                          onClick={() => setTodayPrintSort('desc')}
+                                          className={`px-2 py-1 rounded text-[8px] font-black transition-all uppercase ${todayPrintSort === 'desc' ? 'bg-blue-600 text-white' : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-700'}`}
+                                      >
+                                          TERBARU
+                                      </button>
+                                      <button 
+                                          onClick={() => setTodayPrintSort('asc')}
+                                          className={`px-2 py-1 rounded text-[8px] font-black transition-all uppercase ${todayPrintSort === 'asc' ? 'bg-blue-600 text-white' : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-700'}`}
+                                      >
+                                          TERLAMA
+                                      </button>
+                                  </div>
+                              </div>
+                              <button 
+                                  onClick={() => handlePrint({ type: 'logs-today', sort: todayPrintSort, timeframe: todayPrintTimeframe })}
+                                  className="w-full flex items-center justify-center gap-2 bg-blue-600 dark:bg-blue-700 text-white hover:bg-blue-500 dark:hover:bg-blue-600 px-4 py-3 rounded-lg text-[10px] font-black uppercase tracking-widest transition-all shadow-sm group btn-interact"
+                              >
+                                  <Printer size={14} className="group-hover:scale-110 transition-transform" /> {
+                                      todayPrintTimeframe === 'today' ? 'CETAK MUTASI HARI INI' :
+                                      todayPrintTimeframe === '1_minggu' ? 'CETAK MUTASI 1 MINGGU' :
+                                      todayPrintTimeframe === '2_minggu' ? 'CETAK MUTASI 2 MINGGU' :
+                                      todayPrintTimeframe === '3_minggu' ? 'CETAK MUTASI 3 MINGGU' : 'CETAK SEMUA MUTASI WAKTU'
+                                  }
+                              </button>
+                          </div>
+                      </div>
+
+                      {/* Section 2: Cetak Semua Aset Di Luar Gudang */}
+                      <div className="bg-white dark:bg-[#020617]/40 p-4 rounded-xl border border-slate-200/60 dark:border-slate-800/60 flex flex-col justify-between space-y-3">
+                          <div>
+                              <p className="text-[9px] font-black text-amber-500 uppercase tracking-widest">2. ASET DI LUAR GUDANG</p>
+                              <p className="text-[8px] text-slate-400 dark:text-slate-500 uppercase font-semibold mt-1">
+                                  Cetak daftar seluruh barang atau senjata yang saat ini statusnya di luar gudang.
+                              </p>
+                          </div>
+                          
+                          <div className="pt-2">
+                              <button 
+                                  onClick={() => handlePrint({ type: 'assets-out' })}
+                                  className="w-full flex items-center justify-center gap-2 bg-amber-600 dark:bg-amber-700 text-white hover:bg-amber-500 dark:hover:bg-amber-600 px-4 py-3 rounded-lg text-[10px] font-black uppercase tracking-widest transition-all shadow-sm group btn-interact"
+                              >
+                                  <Printer size={14} className="group-hover:scale-110 transition-transform" /> CETAK SEMUA ASET LUAR
+                              </button>
+                          </div>
+                      </div>
+                  </div>
               </div>
 
               {/* Actual mobile scanner view using html5-qrcode */}
-              {cameraActive && (
-                <div className="mt-6 bg-slate-50 dark:bg-[#020617] border-2 border-emerald-500/50 rounded-[24px] p-6 text-center shadow-[0_0_20px_rgba(16,185,129,0.2)]">
-                  <div id="reader" className="w-full mx-auto overflow-hidden rounded-[16px] mb-4" />
-                  <button 
-                    onClick={() => setCameraActive(false)}
-                    className="bg-red-900/50 text-red-500 px-6 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest hover:bg-red-600 hover:text-slate-900 dark:text-white border border-red-500/50"
-                  >
-                    Tutup Kamera
-                  </button>
-                </div>
-              )}
+              <div className={`mt-6 bg-slate-50 dark:bg-[#020617] border-2 border-emerald-500/50 rounded-[24px] p-6 text-center shadow-[0_0_20px_rgba(16,185,129,0.2)] relative overflow-hidden transition-all duration-300 ${
+                cameraActive ? "block" : "hidden"
+              } ${
+                scanStatus === 'success_in' ? 'flash-success-in text-white' :
+                scanStatus === 'success_out' ? 'flash-success-out text-white' :
+                scanStatus === 'error' ? 'flash-error text-white' : ''
+              }`}>
+                  {scanStatus && (
+                    <div className={`absolute inset-0 z-50 flex flex-col items-center justify-center pointer-events-none transition-all duration-300 ${
+                      scanStatus === 'success_in' ? 'bg-emerald-600/90' :
+                      scanStatus === 'success_out' ? 'bg-blue-600/90' : 'bg-red-600/90'
+                    }`}>
+                      <div className="text-xs font-black uppercase tracking-[0.2em] text-white text-center">
+                        {scanStatus === 'success_in' ? '✓ IN SUKSES' :
+                         scanStatus === 'success_out' ? '⇗ OUT SUKSES' : '✗ TIDAK DIKENAL'}
+                      </div>
+                    </div>
+                  )}
+                <div id="reader" className="w-full mx-auto overflow-hidden rounded-[16px] mb-4" />
+                <button 
+                  onClick={() => setCameraActive(false)}
+                  className="bg-red-900/50 text-red-500 px-6 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest hover:bg-red-600 hover:text-slate-900 dark:text-white border border-red-500/50"
+                >
+                  Tutup Kamera
+                </button>
+              </div>
 
               {/* Session Logs Panel */}
               <div className="mt-10 space-y-4">
@@ -2190,113 +3229,154 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                  </div>
               </div>
               <div className="bg-white dark:bg-[#1e293b] p-6 rounded-[30px] border border-slate-200 dark:border-slate-800 bg-carbon overflow-hidden">
-                  <div className="flex flex-col md:flex-row items-center gap-4 mb-6">
-                      <button 
-                         onClick={() => {
-                            const displayedIds = inventory
-                               .filter(item => (item.name || "").toLowerCase().includes((inventorySearch || "").toLowerCase()) || (item.id || "").toLowerCase().includes((inventorySearch || "").toLowerCase()) || (item.serial || "").toLowerCase().includes((inventorySearch || "").toLowerCase()))
-                               .filter(item => inventoryCategoryFilter === "ALL" || item.category === inventoryCategoryFilter)
-                               .map(i => i.id);
-                            
-                            const isAllSelected = displayedIds.length > 0 && displayedIds.every(id => selectedItems.includes(id));
-                            if (isAllSelected) {
-                               setSelectedItems(selectedItems.filter(id => !displayedIds.includes(id)));
-                            } else {
-                               const newIds = displayedIds.filter(id => !selectedItems.includes(id));
-                               setSelectedItems([...selectedItems, ...newIds]);
-                            }
-                         }}
-                         className="bg-emerald-950/20 p-3 rounded-xl border border-emerald-900/50 flex-shrink-0 hover:bg-emerald-950/40 transition-colors"
-                      >
-                         <div className={`w-5 h-5 border-2 rounded flex items-center justify-center ${(() => {
-                             const displayedIds = inventory
-                               .filter(item => (item.name || "").toLowerCase().includes((inventorySearch || "").toLowerCase()) || (item.id || "").toLowerCase().includes((inventorySearch || "").toLowerCase()) || (item.serial || "").toLowerCase().includes((inventorySearch || "").toLowerCase()))
-                               .filter(item => inventoryCategoryFilter === "ALL" || item.category === inventoryCategoryFilter)
-                               .map(i => i.id);
-                             return displayedIds.length > 0 && displayedIds.every(id => selectedItems.includes(id));
-                         })() ? 'border-emerald-500 bg-emerald-500' : 'border-emerald-500/50'}`}>
-                             {(() => {
-                                 const displayedIds = inventory
-                                   .filter(item => (item.name || "").toLowerCase().includes((inventorySearch || "").toLowerCase()) || (item.id || "").toLowerCase().includes((inventorySearch || "").toLowerCase()) || (item.serial || "").toLowerCase().includes((inventorySearch || "").toLowerCase()))
-                                   .filter(item => inventoryCategoryFilter === "ALL" || item.category === inventoryCategoryFilter)
-                                   .map(i => i.id);
+                  {/* Filter & Pencarian Bar */}
+                  <div className="flex flex-col xl:flex-row items-stretch xl:items-center gap-3 mb-4">
+                      {/* Left: Button Select-All & Input Pencarian */}
+                      <div className="flex items-center gap-3 flex-1">
+                          <button 
+                             onClick={() => {
+                                const displayedIds = filteredInventory.map(i => i.id);
+                                const isAllSelected = displayedIds.length > 0 && displayedIds.every(id => selectedItems.includes(id));
+                                if (isAllSelected) {
+                                   setSelectedItems(selectedItems.filter(id => !displayedIds.includes(id)));
+                                } else {
+                                   const newIds = displayedIds.filter(id => !selectedItems.includes(id));
+                                   setSelectedItems([...selectedItems, ...newIds]);
+                                }
+                             }}
+                             className="bg-emerald-950/20 p-3 rounded-xl border border-emerald-900/50 flex-shrink-0 hover:bg-emerald-950/40 transition-colors"
+                             title="Pilih / Uncheck Semua Aset Terfilter"
+                          >
+                             <div className={`w-5 h-5 border-2 rounded flex items-center justify-center ${(() => {
+                                 const displayedIds = filteredInventory.map(i => i.id);
                                  return displayedIds.length > 0 && displayedIds.every(id => selectedItems.includes(id));
-                             })() && <div className="w-2.5 h-2.5 bg-slate-50 dark:bg-[#020617] rounded-sm"></div>}
-                         </div> 
-                      </button>
-                      <div className="relative flex-1 w-full">
-                          <input 
-                            type="text" 
-                            value={inventorySearch}
-                            onChange={(e) => setInventorySearch(e.target.value)}
-                            placeholder="CARI ASET..." 
-                            className="w-full bg-white dark:bg-[#020617] border border-slate-200 dark:border-slate-800 pl-12 shadow-sm pr-4 py-3 rounded-xl text-xs font-black uppercase tracking-widest outline-none focus:border-emerald-500 transition-colors text-slate-900 dark:text-white" 
-                          />
-                          <Search size={16} className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-600 dark:text-slate-400" />
+                             })() ? 'border-emerald-500 bg-emerald-500' : 'border-emerald-500/50'}`}>
+                                 {(() => {
+                                     const displayedIds = filteredInventory.map(i => i.id);
+                                     return displayedIds.length > 0 && displayedIds.every(id => selectedItems.includes(id));
+                                 })() && <div className="w-2.5 h-2.5 bg-slate-50 dark:bg-[#020617] rounded-sm"></div>}
+                             </div> 
+                          </button>
+                          
+                          <div className="relative flex-1">
+                              <input 
+                                type="text" 
+                                value={inventorySearch}
+                                onChange={(e) => setInventorySearch(e.target.value)}
+                                placeholder="CARI ASET (Ketik atau Scan Barcode...)" 
+                                className="w-full bg-white dark:bg-[#020617]/70 border border-slate-200 dark:border-slate-800 pl-11 shadow-sm pr-4 py-3 rounded-xl text-xs font-black uppercase tracking-widest outline-none focus:border-emerald-500 transition-colors text-slate-900 dark:text-white" 
+                              />
+                              <Search size={16} className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-600 dark:text-slate-400" />
+                          </div>
                       </div>
-                      {/* Overdue Quick Filter Button */}
-                      <button
-                        type="button"
-                        onClick={() => setOnlyOverdueFilter(!onlyOverdueFilter)}
-                        className={`shadow-[0_2px_10px_rgba(0,0,0,0.02)] px-4 py-3 rounded-xl text-xs font-black uppercase tracking-widest outline-none flex items-center justify-center gap-2 border w-full md:w-auto transition-all cursor-pointer ${
-                          onlyOverdueFilter
-                            ? "bg-rose-600 text-white border-rose-600 dark:bg-rose-500 hover:bg-rose-500 dark:hover:bg-rose-450 shadow-[0_0_12px_rgba(244,63,94,0.4)]"
-                            : "bg-slate-50 dark:bg-[#020617]/50 text-slate-600 dark:text-slate-400 border-slate-200 dark:border-slate-800 hover:border-slate-300 dark:hover:bg-slate-700"
-                        }`}
-                      >
-                        <AlertTriangle size={14} className={onlyOverdueFilter ? "animate-pulse" : ""} />
-                        <span>OVERDUE ({inventory.filter(i => i.status === 'Keluar' && i.dueDate && Date.now() > i.dueDate).length})</span>
-                      </button>
 
-                      <select 
-                        value={inventoryCategoryFilter}
-                        onChange={(e) => setInventoryCategoryFilter(e.target.value)}
-                        className="bg-white dark:bg-[#020617]/50 shadow-[0_2px_10px_rgba(0,0,0,0.02)] border border-slate-200 dark:border-slate-800 px-4 py-3 rounded-xl text-xs font-black text-emerald-500 uppercase tracking-widest outline-none w-full md:w-auto"
-                      >
-                         <option value="ALL">SEMUA KATEGORI</option>
-                         {appSettings.categories.map(c => <option key={c} value={c}>{c}</option>)}
-                      </select>
-                      <select 
-                        value={inventorySort}
-                        onChange={(e) => setInventorySort(e.target.value as any)}
-                        className="bg-white dark:bg-[#020617]/50 shadow-[0_2px_10px_rgba(0,0,0,0.02)] border border-slate-200 dark:border-slate-800 px-4 py-3 rounded-xl text-xs font-black text-emerald-500 uppercase tracking-widest outline-none w-full md:w-auto"
-                      >
-                         <option value="newest">TERBARU TERLEBIH DAHULU</option>
-                         <option value="oldest">TERLAMA TERLEBIH DAHULU</option>
-                      </select>
-                      <select 
-                        value={printLayout}
-                        onChange={(e) => setPrintLayout(e.target.value as any)}
-                        className="bg-white dark:bg-[#020617]/50 shadow-[0_2px_10px_rgba(0,0,0,0.02)] border border-slate-200 dark:border-slate-800 px-4 py-3 rounded-xl text-xs font-black text-emerald-500 uppercase tracking-widest outline-none w-full md:w-auto"
-                      >
-                         <option value="auto">LAYOUT: AUTO (CERDAS)</option>
-                         <option value="normal">LAYOUT: NORMAL</option>
-                         <option value="compact">LAYOUT: COMPACT</option>
-                      </select>
-                      <button 
-                        onClick={() => {
-                           if(selectedItems.length === 0) { alert('Pilih aset yang ingin dicetak'); return; }
-                           let isCompact = printLayout === 'compact';
-                           if(printLayout === 'auto') {
-                               isCompact = selectedItems.length > 21; // automatically use compact layout for > 21 items (approximately fitting standard A4 sizes nicely)
-                           }
-                           handlePrint({ type: 'inventory-selection', ids: selectedItems, compact: isCompact });
-                        }}
-                        disabled={selectedItems.length === 0}
-                        className="bg-slate-100 dark:bg-slate-800 hover:bg-slate-300 dark:hover:bg-slate-700 border border-slate-300 dark:border-slate-700 text-slate-900 dark:text-white px-4 py-3 rounded-xl text-[10px] font-black uppercase tracking-widest flex items-center justify-center gap-2 transition-colors w-full md:w-auto disabled:opacity-50 disabled:cursor-not-allowed"
-                      >
-                         <Printer size={14} /> A4 CETAK
-                      </button>
-                      <button 
-                        onClick={() => {
-                           if(selectedItems.length === 0) { alert('Pilih aset yang ingin dicetak'); return; }
-                           handlePrint({ type: 'barcode-roll', ids: selectedItems });
-                        }}
-                        disabled={selectedItems.length === 0}
-                        className="bg-orange-100 dark:bg-orange-900/30 hover:bg-orange-200 dark:hover:bg-orange-900/50 border border-orange-300 dark:border-orange-800 text-orange-700 dark:text-orange-400 px-4 py-3 rounded-xl text-[10px] font-black uppercase tracking-widest flex items-center justify-center gap-2 transition-colors w-full md:w-auto disabled:opacity-50 disabled:cursor-not-allowed"
-                      >
-                         <Printer size={14} /> BARCODE (ROLL) {selectedItems.length > 0 ? `(${selectedItems.length})` : ''}
-                      </button>
+                      {/* Right: Quick Filters & Select Dropdowns */}
+                      <div className="flex flex-wrap items-center gap-2">
+                          {/* Overdue Quick Filter Button */}
+                          <button
+                            type="button"
+                            onClick={() => setOnlyOverdueFilter(!onlyOverdueFilter)}
+                            className={`shadow-[0_2px_10px_rgba(0,0,0,0.02)] px-4 py-3 rounded-xl text-[10px] font-black uppercase tracking-widest outline-none flex items-center justify-center gap-1.5 border transition-all cursor-pointer ${
+                              onlyOverdueFilter
+                                ? "bg-rose-600 text-white border-rose-600 dark:bg-rose-500 hover:bg-rose-500 dark:hover:bg-rose-450 shadow-[0_0_12px_rgba(244,63,94,0.4)]"
+                                : "bg-slate-50 dark:bg-[#020617]/50 text-slate-600 dark:text-slate-400 border-slate-200 dark:border-slate-800 hover:border-slate-300 dark:hover:bg-slate-700"
+                            }`}
+                          >
+                            <AlertTriangle size={13} className={onlyOverdueFilter ? "animate-pulse" : ""} />
+                            <span>OVERDUE ({inventory.filter(i => i.status === 'Keluar' && i.dueDate && Date.now() > i.dueDate).length})</span>
+                          </button>
+
+                          <select 
+                            value={inventoryCategoryFilter}
+                            onChange={(e) => setInventoryCategoryFilter(e.target.value)}
+                            className="bg-white dark:bg-[#020617]/50 shadow-[0_2px_10px_rgba(0,0,0,0.02)] border border-slate-200 dark:border-slate-800 px-3 py-3 rounded-xl text-[10px] font-black text-emerald-500 uppercase tracking-widest outline-none"
+                          >
+                             <option value="ALL">SEMUA KATEGORI</option>
+                             {appSettings.categories.map(c => <option key={c} value={c}>{c}</option>)}
+                          </select>
+
+                          <select 
+                            value={inventorySort}
+                            onChange={(e) => setInventorySort(e.target.value as any)}
+                            className="bg-white dark:bg-[#020617]/50 shadow-[0_2px_10px_rgba(0,0,0,0.02)] border border-slate-200 dark:border-slate-800 px-3 py-3 rounded-xl text-[10px] font-black text-emerald-500 uppercase tracking-widest outline-none"
+                          >
+                             <option value="newest">TERBARU</option>
+                             <option value="oldest">TERLAMA</option>
+                             <option value="popor">NO. POPOR</option>
+                             <option value="barcode">BARCODE / SKU</option>
+                          </select>
+                      </div>
+                  </div>
+
+                  {/* Panel Print Label Barcode / QR Code Suite */}
+                  <div className="border border-emerald-500/20 dark:border-emerald-500/10 bg-emerald-500/5 dark:bg-emerald-950/10 rounded-2xl p-4 mb-6 flex flex-col lg:flex-row items-stretch lg:items-center justify-between gap-4 transition-all animate-in fade-in">
+                      <div className="flex items-center gap-3">
+                          <div className="w-10 h-10 rounded-xl bg-emerald-600/10 border border-emerald-500/30 flex items-center justify-center text-emerald-500 shrink-0">
+                              <Printer size={18} className={selectedItems.length > 0 ? "animate-pulse md:scale-110" : ""} />
+                          </div>
+                          <div>
+                              <p className="text-[11px] font-black uppercase text-emerald-500 tracking-wider">Cetak Label & Barcode</p>
+                              <p className="text-[9px] text-slate-500 dark:text-slate-400 font-bold uppercase tracking-widest mt-0.5">
+                                  {selectedItems.length > 0 
+                                      ? `${selectedItems.length} ASET TERPILIH untuk dicetak` 
+                                      : "Pilih satu atau beberapa aset di bawah untuk mulai mencetak"}
+                              </p>
+                          </div>
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-3">
+                          <div className="flex items-center gap-2">
+                             <span className="text-[9px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest">Layout:</span>
+                             <select 
+                               value={printLayout}
+                               onChange={(e) => setPrintLayout(e.target.value as any)}
+                               className="bg-white dark:bg-[#020617]/50 shadow-[0_2px_10px_rgba(0,0,0,0.02)] border border-slate-200 dark:border-slate-800 px-3 py-2 rounded-xl text-[10px] font-black text-emerald-500 uppercase tracking-widest outline-none"
+                             >
+                                <option value="auto">CERDAS (AUTO)</option>
+                                <option value="normal">NORMAL</option>
+                                <option value="compact">COMPACT</option>
+                             </select>
+                          </div>
+
+                          <div className="flex flex-wrap items-center gap-2 flex-1 sm:flex-initial">
+                              <button 
+                                onClick={() => {
+                                   if(selectedItems.length === 0) { alert('Harap pilih beberapa aset di dalam tabel terlebih dahulu!'); return; }
+                                   setShowLabelStudio(true);
+                                }}
+                                disabled={selectedItems.length === 0}
+                                className="bg-emerald-600 dark:bg-emerald-500 hover:bg-emerald-500 text-slate-950 font-black px-4 py-2.5 rounded-xl text-[9px] uppercase tracking-widest flex items-center justify-center gap-1.5 transition-all disabled:opacity-40 disabled:cursor-not-allowed select-none shadow-md shadow-emerald-500/10 active:scale-95 cursor-pointer flex-1 sm:flex-initial"
+                              >
+                                 <Printer size={13} /> STUDIO {selectedItems.length > 0 ? `(${selectedItems.length})` : ''}
+                              </button>
+                              
+                              <button 
+                                onClick={() => {
+                                   if(selectedItems.length === 0) { alert('Pilih aset yang ingin dicetak'); return; }
+                                   let isCompact = printLayout === 'compact';
+                                   if(printLayout === 'auto') {
+                                       isCompact = selectedItems.length > 21; // automatically use compact layout for > 21 items
+                                   }
+                                   handlePrint({ type: 'inventory-selection', ids: selectedItems, compact: isCompact });
+                                }}
+                                disabled={selectedItems.length === 0}
+                                className="bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 border border-slate-300 dark:border-slate-700 text-slate-900 dark:text-white px-4 py-2.5 rounded-xl text-[9px] font-black uppercase tracking-widest flex items-center justify-center gap-1.5 transition-colors disabled:opacity-40 disabled:cursor-not-allowed flex-1 sm:flex-initial"
+                              >
+                                 <Printer size={13} /> A4 FAST GRID
+                              </button>
+                              
+                              <button 
+                                onClick={() => {
+                                   if(selectedItems.length === 0) { alert('Pilih aset yang ingin dicetak'); return; }
+                                   handlePrint({ type: 'barcode-roll', ids: selectedItems });
+                                }}
+                                disabled={selectedItems.length === 0}
+                                className="bg-orange-105 hover:bg-orange-150 dark:bg-orange-950/40 dark:hover:bg-orange-950/60 border border-orange-300 dark:border-orange-850 text-orange-700 dark:text-orange-400 px-4 py-2.5 rounded-xl text-[9px] font-black uppercase tracking-widest flex items-center justify-center gap-1.5 transition-colors disabled:opacity-40 disabled:cursor-not-allowed flex-1 sm:flex-initial"
+                              >
+                                 <Printer size={13} /> THERMAL ROLL {selectedItems.length > 0 ? `(${selectedItems.length})` : ''}
+                              </button>
+                          </div>
+                      </div>
                   </div>
                   <div className="overflow-x-auto bg-white shadow-[0_2px_10px_rgba(0,0,0,0.02)] dark:bg-[#020617] rounded-2xl border border-slate-200 dark:border-slate-800">
                       <table className="w-full text-left min-w-[800px]">
@@ -2317,13 +3397,28 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                           </thead>
                           <tbody className="divide-y divide-slate-800/50">
                               {filteredInventory
-                                .sort((a, b) => inventorySort === 'newest' ? new Date(b.date).getTime() - new Date(a.date).getTime() : new Date(a.date).getTime() - new Date(b.date).getTime())
+                                .sort((a, b) => {
+                                  if (inventorySort === 'popor') {
+                                    const aPop = parseInt(a.popor || '', 10);
+                                    const bPop = parseInt(b.popor || '', 10);
+                                    if (!isNaN(aPop) && !isNaN(bPop)) {
+                                      return aPop - bPop;
+                                    }
+                                    return (a.popor || '').localeCompare(b.popor || '', undefined, { numeric: true, sensitivity: 'base' });
+                                  }
+                                  if (inventorySort === 'barcode') {
+                                    return (a.id || '').localeCompare(b.id || '', undefined, { numeric: true, sensitivity: 'base' });
+                                  }
+                                  return inventorySort === 'newest'
+                                    ? new Date(b.date || 0).getTime() - new Date(a.date || 0).getTime()
+                                    : new Date(a.date || 0).getTime() - new Date(b.date || 0).getTime();
+                                })
                                 .slice((inventoryPage - 1) * 10, inventoryPage * 10)
                                 .map((item, i) => {
                                   const isOverdue = item.status === 'Keluar' && item.dueDate && Date.now() > item.dueDate;
                                   const isSelected = selectedItems.includes(item.id);
                                   return (
-                                  <tr key={item.id} className={`inventory-row transition-colors cursor-pointer ${isSelected ? 'bg-emerald-900/20' : 'hover:bg-slate-200 dark:hover:bg-slate-800/50'}`} onClick={() => setViewingItem(item)}>
+                                  <tr key={item.id} className={`inventory-row transition-all duration-300 ease-in-out cursor-pointer ${isSelected ? 'bg-emerald-100/65 dark:bg-emerald-900/35 border-l-4 border-emerald-500 pl-3 shadow-sm' : 'hover:bg-slate-200 dark:hover:bg-slate-800/50'}`} onClick={() => setViewingItem(item)}>
                                       <td className="p-4 text-center" onClick={(e) => e.stopPropagation()}>
                                          <button 
                                             onClick={() => {
@@ -2354,7 +3449,7 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                                         <p className="text-[10px] font-bold text-slate-600 dark:text-slate-300 uppercase">{item.holder}</p>
                                       </td>
                                       <td className="p-4 flex flex-col items-start justify-center gap-1" onClick={(e) => e.stopPropagation()}>
-                                        <span className={`status-badge ${item.status === 'Di Gudang' ? 'status-gudang' : 'status-keluar'}`}>{item.status}</span>
+                                        <span className={`status-badge ${item.status === 'Di Gudang' ? 'status-gudang' : 'status-keluar animate-pulse'}`}>{item.status}</span>
                                         {isOverdue && <span className="text-[9px] font-black uppercase text-red-500 mt-1 animate-pulse border border-red-500/50 px-2 py-0.5 rounded shadow-[0_0_8px_rgba(239,68,68,0.5)]">OVERDUE</span>}
                                         {!isOverdue && item.status === 'Keluar' && item.dueDate && <span className="text-[8px] font-mono text-orange-400 mt-1">Due: {new Date(item.dueDate).toLocaleTimeString('id-ID')}</span>}
                                         {item.status === 'Keluar' && (
@@ -2526,6 +3621,55 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
           </div>
         )}
 
+        {activeTab === 'labelgen' && (
+          <div className="max-w-2xl mx-auto py-10 animate-in fade-in">
+              <h2 className="text-2xl md:text-3xl font-black text-slate-900 dark:text-white italic uppercase text-center mb-6"><span className="text-emerald-500/50 mr-2">[</span>Label Generator<span className="text-emerald-500/50 ml-2">]</span></h2>
+              <div className="bg-white dark:bg-[#1e293b] p-6 md:p-8 rounded-[30px] border border-slate-200 dark:border-slate-800 bg-carbon">
+                 <div className="flex flex-col md:flex-row justify-between items-center mb-6 gap-4 border-b border-slate-200 dark:border-slate-800 pb-4">
+                   <p className="text-slate-600 dark:text-slate-400 text-sm text-center md:text-left">Cetak stiker barcode / QR Code secara instan tanpa perlu mendaftarkan aset ke inventaris.</p>
+                 </div>
+                 <div className="space-y-4">
+                     <div>
+                       <label className="text-[10px] font-bold text-slate-600 dark:text-slate-400 uppercase tracking-widest">ID Aset / Barcode</label>
+                       <input value={labelGenForm.id} onChange={e=>setLabelGenForm({...labelGenForm, id: e.target.value})} type="text" className="w-full mt-1 bg-slate-50 dark:bg-[#020617]/80 border border-slate-300 dark:border-slate-700 rounded-xl p-4 text-slate-900 dark:text-white text-sm font-mono uppercase focus:border-emerald-500 outline-none" placeholder="KODE BARCODE" />
+                     </div>
+                     <div>
+                       <label className="text-[10px] font-bold text-slate-600 dark:text-slate-400 uppercase tracking-widest">Nama Aset / Judul</label>
+                       <input value={labelGenForm.name} onChange={e=>setLabelGenForm({...labelGenForm, name: e.target.value})} type="text" className="w-full mt-1 bg-slate-50 dark:bg-[#020617]/80 border border-slate-300 dark:border-slate-700 rounded-xl p-4 text-slate-900 dark:text-white text-sm uppercase focus:border-emerald-500 outline-none" placeholder="NAMA ASET" />
+                     </div>
+                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                       <div>
+                         <label className="text-[10px] font-bold text-slate-600 dark:text-slate-400 uppercase tracking-widest">Nomor Seri Pabrik (S/N)</label>
+                         <input value={labelGenForm.serial} onChange={e=>setLabelGenForm({...labelGenForm, serial: e.target.value})} type="text" className="w-full mt-1 bg-slate-50 dark:bg-[#020617]/80 border border-slate-300 dark:border-slate-700 rounded-xl p-4 text-slate-900 dark:text-white text-sm uppercase focus:border-emerald-500 outline-none" placeholder="OPSIONAL" />
+                       </div>
+                       <div>
+                         <label className="text-[10px] font-bold text-slate-600 dark:text-slate-400 uppercase tracking-widest">Tipe Kertas (Format Print)</label>
+                         <select value={labelGenForm.printType} onChange={e=>setLabelGenForm({...labelGenForm, printType: e.target.value})} className="w-full mt-1 bg-slate-50 dark:bg-[#020617]/80 border border-slate-300 dark:border-slate-700 rounded-xl p-4 text-slate-900 dark:text-white text-sm uppercase focus:border-emerald-500 outline-none appearance-none">
+                            <option value="custom-label-a4">Format Kertas A4 (Grid)</option>
+                            <option value="custom-label-roll">Format Sticker Roll (Thermal)</option>
+                         </select>
+                       </div>
+                     </div>
+                 </div>
+                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-8">
+                     <button onClick={() => {
+                        if(!labelGenForm.id) return alert("ID Barcode tidak boleh kosong!");
+                        handlePrint({ type: labelGenForm.printType, data: labelGenForm, quantity: 1, customStudio: { size: 'lg', showName: true, showSKU: true } });
+                     }} className="w-full bg-slate-100/10 border border-slate-300 dark:border-slate-700 text-slate-900 dark:text-white font-black text-sm uppercase tracking-widest p-4 py-5 rounded-xl hover:bg-slate-50 dark:hover:bg-slate-800 flex items-center justify-center gap-2 cyber-cut transition-colors">CETAK 1 LABEL SAJA</button>
+                     
+                     <button onClick={() => {
+                        if(!labelGenForm.id) return alert("ID Barcode tidak boleh kosong!");
+                        const qty = prompt("Berapa banyak label yang ingin dicetak secara bersamaan?", "10");
+                        const parsedQty = parseInt(qty || '0');
+                        if (parsedQty > 0) {
+                            handlePrint({ type: labelGenForm.printType, data: labelGenForm, quantity: parsedQty, customStudio: { size: 'lg', showName: true, showSKU: true } });
+                        }
+                     }} className="w-full bg-emerald-600 text-slate-900 dark:text-white font-black text-sm uppercase tracking-widest p-4 py-5 rounded-xl hover:bg-emerald-500 flex items-center justify-center gap-2 shadow-xl shadow-emerald-900/20 cyber-cut transition-colors">CETAK BANYAK (BULK)</button>
+                 </div>
+              </div>
+          </div>
+        )}
+
         {activeTab === 'opname' && (
           <div className="max-w-6xl mx-auto py-10 animate-in fade-in">
               {!opnameSession?.active ? (
@@ -2551,7 +3695,7 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                 <div>
                    <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-6 gap-4">
                      <h2 className="text-2xl font-black text-slate-900 dark:text-white italic uppercase"><span className="text-emerald-500/50 mr-2">[</span>Sesi Opname Sedang Berjalan<span className="text-emerald-500/50 ml-2">]</span></h2>
-                     <button onClick={() => setOpnameSession(null)} className="btn-interact cyber-cut bg-red-600 text-slate-900 dark:text-white px-6 py-3 font-black uppercase tracking-widest hover:bg-red-500 text-xs shadow-lg flex items-center gap-2"><X size={16} /> Akhiri Sesi</button>
+                     <button onClick={() => setShowOpnameEndConfirm(true)} className="btn-interact cyber-cut bg-red-600 text-slate-900 dark:text-white px-6 py-3 font-black uppercase tracking-widest hover:bg-red-500 text-xs shadow-lg flex items-center gap-2"><X size={16} /> Akhiri Sesi</button>
                    </div>
                    <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
                        <div className="bg-slate-50 dark:bg-[#020617] p-5 rounded-[20px] border border-slate-200 dark:border-slate-800 text-center"><p className="text-[9px] text-slate-600 dark:text-slate-400 font-black uppercase tracking-widest mb-1">Diharapkan (In)</p><p className="text-2xl md:text-3xl font-black text-slate-900 dark:text-white">{opnameSession.expected.length}</p></div>
@@ -2846,6 +3990,7 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
         {activeTab === 'users' && (
           <div className="max-w-4xl mx-auto py-10 animate-in fade-in">
               <h2 className="text-2xl md:text-3xl font-black text-slate-900 dark:text-white italic uppercase text-center mb-6"><span className="text-emerald-500/50 mr-2">[</span>Manajemen Akses<span className="text-emerald-500/50 ml-2">]</span></h2>
+             {currentUser?.role === 'superadmin' && (
                <div className="bg-white dark:bg-[#1e293b] p-6 md:p-8 rounded-[30px] border border-slate-200 dark:border-slate-800 bg-carbon mb-8">
                  <h3 className="text-xs font-black text-blue-500 uppercase tracking-widest mb-6 flex items-center gap-2">Registrasi Admin Baru</h3>
                  <div className="flex flex-col md:flex-row gap-4">
@@ -2867,6 +4012,7 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                    }} className="btn-interact cyber-cut bg-blue-600 text-slate-900 dark:text-white px-8 py-4 font-black uppercase tracking-widest hover:bg-blue-500 transition-all">Tambah</button>
                  </div>
               </div>
+             )}
               <div className="bg-white dark:bg-[#1e293b] p-6 md:p-8 rounded-[30px] border border-slate-200 dark:border-slate-800 bg-carbon overflow-hidden">
                   <h3 className="text-xs font-black text-slate-600 dark:text-slate-300 uppercase tracking-widest mb-6">Daftar Pengguna Sistem</h3>
                   <div className="overflow-x-auto bg-white shadow-[0_2px_10px_rgba(0,0,0,0.02)] dark:bg-[#020617] rounded-2xl border border-slate-200 dark:border-slate-800">
@@ -2897,7 +4043,7 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                                                 Ubah Sandi
                                             </button>
                                         )}
-                                        {u.role !== 'superadmin' && u.username !== 'RYO KUN' && <button onClick={async ()=>{
+                                        {currentUser?.role === 'superadmin' && u.role !== 'superadmin' && u.username !== 'RYO KUN' && <button onClick={async ()=>{
                                             if(window.confirm(`Hapus admin ${u.username}?`)) {
                                                 try {
                                                     await deleteDoc(doc(db, "users", u.username));
@@ -3173,15 +4319,15 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                  animate={{ y: 0, scale: 1, opacity: 1 }} 
                  exit={{ y: 30, scale: 0.95, opacity: 0 }} 
                  transition={{ type: "spring", damping: 28, stiffness: 320, mass: 0.9 }}
-                 className="bg-[#050b14] flex flex-col max-h-[90vh] border border-blue-900/50 rounded-[40px] max-w-2xl w-full overflow-hidden shadow-[0_0_50px_rgba(59,130,246,0.15)] cyber-cut relative"
+                 className="bg-white dark:bg-[#050b14] flex flex-col max-h-[90vh] border border-slate-200 dark:border-blue-900/50 rounded-[40px] max-w-2xl w-full overflow-hidden shadow-2xl dark:shadow-[0_0_50px_rgba(59,130,246,0.15)] cyber-cut relative"
                  onClick={e => e.stopPropagation()}
                >
                  <div className="absolute top-6 right-6 flex items-center justify-end gap-2 z-10">
                    <button onClick={() => handlePrint({ type: 'barcode-roll', ids: [viewingItem.id] })} className="text-orange-600 dark:text-orange-500 hover:text-orange-900 dark:text-orange-300 p-2 bg-orange-50 dark:bg-orange-950/30 rounded-xl border border-orange-200 dark:border-orange-900/50 flex items-center gap-2 font-black text-[9px] uppercase tracking-widest"><Printer size={16} /> ROLL LABEL</button>
                    <button onClick={() => setViewingItem(null)} className="text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:text-white p-2 bg-slate-50 dark:bg-[#020617] rounded-xl border border-slate-200 dark:border-slate-800"><X size={16} /></button>
                  </div>
-                 <div className="bg-blue-950/30 p-8 border-b border-blue-900/30 shrink-0">
-                    <div className="w-16 h-16 bg-blue-950 border border-blue-900/50 rounded-2xl flex flex-col items-center justify-center text-blue-500 mb-6 cyber-cut shadow-[0_0_15px_rgba(59,130,246,0.2)]">
+                 <div className="bg-blue-50 dark:bg-blue-950/30 p-8 border-b border-blue-105 @apply border-slate-200 dark:border-blue-900/30 shrink-0">
+                    <div className="w-16 h-16 bg-blue-100 dark:bg-blue-950 border border-blue-200 dark:border-blue-900/50 rounded-2xl flex flex-col items-center justify-center text-blue-600 dark:text-blue-500 mb-6 cyber-cut shadow-[0_0_15px_rgba(59,130,246,0.2)]">
                        <FileText size={24} />
                     </div>
                     <h2 className="text-2xl font-black text-slate-900 dark:text-white uppercase tracking-wider">{viewingItem.name}</h2>
@@ -3351,12 +4497,12 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                  animate={{ y: 0, scale: 1, opacity: 1 }} 
                  exit={{ y: 30, scale: 0.95, opacity: 0 }} 
                  transition={{ type: "spring", damping: 28, stiffness: 320, mass: 0.9 }}
-                 className="bg-[#050b14] border border-orange-900/50 rounded-[40px] max-w-2xl w-full shadow-[0_0_50px_rgba(249,115,22,0.15)] cyber-cut relative my-auto"
+                 className="bg-white dark:bg-[#050b14] border border-slate-200 dark:border-orange-900/50 rounded-[40px] max-w-2xl w-full shadow-2xl dark:shadow-[0_0_50px_rgba(249,115,22,0.15)] cyber-cut relative my-auto"
                  onClick={e => e.stopPropagation()}
                >
                  <button onClick={() => setEditingItem(null)} className="absolute top-6 right-6 text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:text-white p-2 bg-slate-50 dark:bg-[#020617] rounded-xl border border-slate-200 dark:border-slate-800 z-10"><X size={16} /></button>
-                 <div className="bg-orange-950/30 p-8 border-b border-orange-900/30">
-                    <div className="w-16 h-16 bg-orange-950 border border-orange-900/50 rounded-2xl flex flex-col items-center justify-center text-orange-500 mb-6 cyber-cut shadow-[0_0_15px_rgba(249,115,22,0.2)]">
+                 <div className="bg-orange-50 dark:bg-orange-950/30 p-8 border-b border-orange-100 dark:border-orange-900/30">
+                    <div className="w-16 h-16 bg-orange-100 dark:bg-orange-950 border border-orange-200 dark:border-orange-900/50 rounded-2xl flex flex-col items-center justify-center text-orange-600 dark:text-orange-500 mb-6 cyber-cut shadow-[0_0_15px_rgba(249,115,22,0.2)]">
                        <Settings size={24} />
                     </div>
                     <h2 className="text-2xl font-black text-slate-900 dark:text-white uppercase tracking-wider">Edit Aset: {editingItem.id}</h2>
@@ -3403,6 +4549,49 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
         </AnimatePresence>
 
         <AnimatePresence>
+          {showOpnameEndConfirm && (
+            <motion.div 
+              initial={{ opacity: 0, backdropFilter: "blur(0px)" }} 
+              animate={{ opacity: 1, backdropFilter: "blur(12px)" }} 
+              exit={{ opacity: 0, backdropFilter: "blur(0px)" }}
+              transition={{ duration: 0.4, ease: [0.22, 1, 0.36, 1] }}
+              className="fixed inset-0 z-[600] flex items-center justify-center p-4 bg-black/40 overflow-y-auto pt-24 pb-24"
+              onClick={() => setShowOpnameEndConfirm(false)}
+            >
+               <motion.div 
+                 initial={{ y: 50, scale: 0.95, opacity: 0 }} 
+                 animate={{ y: 0, scale: 1, opacity: 1 }} 
+                 exit={{ y: 30, scale: 0.95, opacity: 0 }} 
+                 transition={{ type: "spring", damping: 28, stiffness: 320, mass: 0.9 }}
+                 className="bg-white dark:bg-[#050b14] border border-slate-200 dark:border-red-900/50 rounded-[40px] max-w-lg w-full shadow-2xl dark:shadow-[0_0_50px_rgba(239,68,68,0.15)] cyber-cut relative my-auto p-8"
+                 onClick={e => e.stopPropagation()}
+               >
+                 <div className="absolute top-0 right-0 w-32 h-32 bg-red-500/10 dark:bg-red-500/5 rounded-bl-full pointer-events-none blur-3xl"></div>
+                 <div className="flex flex-col items-center text-center space-y-6">
+                    <div className="w-20 h-20 bg-red-100 dark:bg-red-950/40 rounded-full flex items-center justify-center border border-red-200 dark:border-red-900/50">
+                       <AlertTriangle size={36} className="text-red-600 dark:text-red-500" />
+                    </div>
+                    <div className="space-y-2">
+                       <h3 className="text-2xl font-black text-slate-900 dark:text-white uppercase italic">Akhiri Sesi Opname?</h3>
+                       <p className="text-slate-600 dark:text-slate-400 text-sm leading-relaxed">
+                          Anda akan mengakhiri sesi Stock Opname saat ini. Progres yang belum disimpan ke dalam Log tidak akan terbawa ke sesi berikutnya.<br/><br/>Apakah Anda yakin ingin melanjutkan?
+                       </p>
+                    </div>
+                    <div className="flex flex-col sm:flex-row w-full gap-4 pt-4">
+                       <button onClick={() => setShowOpnameEndConfirm(false)} className="flex-1 px-6 py-4 text-xs font-black uppercase text-slate-600 dark:text-slate-400 border border-slate-200 dark:border-slate-800 rounded-xl hover:bg-slate-50 dark:hover:bg-slate-900/50 transition-colors tracking-widest">
+                          Kembali
+                       </button>
+                       <button onClick={() => { setShowOpnameEndConfirm(false); setOpnameSession(null); }} className="flex-1 bg-red-600 hover:bg-red-500 text-slate-900 dark:text-white px-8 py-4 rounded-xl text-xs font-black uppercase tracking-widest shadow-[0_0_20px_rgba(239,68,68,0.3)] cyber-cut transition-all flex items-center justify-center gap-2">
+                          <X size={16} /> Ya, Akhiri
+                       </button>
+                    </div>
+                 </div>
+               </motion.div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        <AnimatePresence>
           {showDriveModal && (
             <motion.div 
               initial={{ opacity: 0, backdropFilter: "blur(0px)" }} 
@@ -3417,13 +4606,13 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                  animate={{ y: 0, scale: 1, opacity: 1 }} 
                  exit={{ y: 30, scale: 0.95, opacity: 0 }} 
                  transition={{ type: "spring", damping: 28, stiffness: 320, mass: 0.9 }}
-                 className="bg-[#050b14] border border-cyan-900/50 rounded-[40px] max-w-2xl w-full shadow-[0_0_50px_rgba(6,182,212,0.15)] cyber-cut relative my-auto p-8"
+                 className="bg-white dark:bg-[#050b14] border border-slate-200 dark:border-cyan-900/50 rounded-[40px] max-w-2xl w-full shadow-2xl dark:shadow-[0_0_50px_rgba(6,182,212,0.15)] cyber-cut relative my-auto p-8"
                  onClick={e => e.stopPropagation()}
                >
                  <button onClick={() => setShowDriveModal(false)} className="absolute top-6 right-6 text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:text-white p-2 bg-slate-50 dark:bg-[#020617] rounded-xl border border-slate-200 dark:border-slate-800 z-10"><X size={16} /></button>
                  
                  <div className="flex flex-col items-center justify-center mb-8">
-                     <div className="w-16 h-16 bg-cyan-950 border border-cyan-900/50 rounded-2xl flex flex-col items-center justify-center text-cyan-500 mb-6 cyber-cut shadow-[0_0_15px_rgba(6,182,212,0.2)]">
+                     <div className="w-16 h-16 bg-cyan-100 dark:bg-cyan-950 border border-cyan-200 dark:border-cyan-900/50 rounded-2xl flex flex-col items-center justify-center text-cyan-600 dark:text-cyan-500 mb-6 cyber-cut shadow-[0_0_15px_rgba(6,182,212,0.2)]">
                         <Cloud size={24} />
                      </div>
                      <h2 className="text-2xl font-black text-slate-900 dark:text-white uppercase tracking-wider text-center">Google Drive Sync</h2>
@@ -3471,7 +4660,10 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                                       <div>
                                          <p className="text-cyan-400 font-mono text-xs truncate max-w-[200px] sm:max-w-xs mb-1">{file.name}</p>
                                       </div>
-                                      <button onClick={() => handleRestoreFromDrive(file.id, file.name)} className="bg-pink-900/30 text-pink-500 border border-pink-900/50 px-4 py-2 flex items-center gap-2 rounded-lg text-[10px] font-black uppercase hover:bg-pink-900/50 transition-colors"><Download size={14}/> Restore</button>
+                                      <div className="flex gap-2">
+                                         <button onClick={() => handleRestoreFromDrive(file.id, file.name)} className="bg-pink-900/30 text-pink-500 border border-pink-900/50 px-4 py-2 flex items-center gap-2 rounded-lg text-[10px] font-black uppercase hover:bg-pink-900/50 transition-colors"><Download size={14}/> Restore</button>
+                                         <button onClick={() => handleDeleteFromDrive(file.id, file.name)} className="bg-red-950/40 text-red-500 border border-red-900/40 px-4 py-2 flex items-center gap-2 rounded-lg text-[10px] font-black uppercase hover:bg-red-900 hover:text-white transition-colors"><Trash2 size={14}/> Hapus</button>
+                                      </div>
                                    </div>
                                ))}
                            </div>
@@ -3651,6 +4843,321 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
           )}
         </AnimatePresence>
 
+        {/* Batch Label Printer Studio Modal */}
+        {showLabelStudio && (
+          <div className="fixed inset-0 bg-black/80 backdrop-blur-md z-[2000] flex items-center justify-center p-4 overflow-y-auto font-sans leading-relaxed">
+            <div className="bg-white dark:bg-[#050b14] border border-slate-200 dark:border-emerald-500/35 rounded-[30px] max-w-5xl w-full shadow-2xl overflow-hidden flex flex-col max-h-[90vh]">
+              {/* Header */}
+              <div className="bg-emerald-50 dark:bg-emerald-950/25 p-6 border-b border-slate-200 dark:border-emerald-900/40 flex justify-between items-center shrink-0">
+                <div className="flex items-center gap-3">
+                  <div className="w-12 h-12 rounded-xl bg-emerald-100 dark:bg-emerald-950 flex items-center justify-center border border-emerald-200 dark:border-emerald-800 text-emerald-600 dark:text-emerald-400">
+                    <Printer size={24} />
+                  </div>
+                  <div className="text-left">
+                    <h3 className="text-lg font-black text-slate-900 dark:text-white uppercase tracking-wider">Gudang Label Printer Studio</h3>
+                    <p className="text-[10px] text-slate-500 dark:text-slate-400 uppercase tracking-widest font-black mt-0.5">Mendesain & Mencetak {selectedItems.length} Stiker Lapangan Secara Massal</p>
+                  </div>
+                </div>
+                <button 
+                  onClick={() => setShowLabelStudio(false)} 
+                  className="text-slate-500 dark:text-slate-400 hover:text-red-500 bg-slate-100 dark:bg-slate-900 p-2 rounded-xl border border-slate-200 dark:border-slate-800"
+                >
+                  <X size={18} />
+                </button>
+              </div>
+
+              {/* Main Body Grid */}
+              <div className="flex-1 overflow-hidden flex flex-col md:flex-row min-h-0">
+                
+                {/* Left Side: Controls Panel */}
+                <div className="w-full md:w-80 border-r border-slate-200 dark:border-slate-800 p-6 space-y-5 overflow-y-auto bg-slate-50 dark:bg-[#020617]/50 max-h-[30vh] md:max-h-none shrink-0 text-left">
+                  
+                  {/* Format Output */}
+                  <div className="space-y-2">
+                    <label className="text-[10px] font-black text-slate-600 dark:text-slate-400 uppercase tracking-wider block">Format Kertas / Layout</label>
+                    <div className="grid grid-cols-2 gap-2">
+                      <button 
+                        onClick={() => setLabelLayout('grid')}
+                        className={`py-2 px-3 rounded-lg text-xs font-bold uppercase border transition-all ${
+                          labelLayout === 'grid' 
+                            ? 'bg-emerald-600 text-white border-emerald-600 dark:bg-emerald-500' 
+                            : 'bg-white dark:bg-slate-900 text-slate-600 border-slate-200 dark:border-slate-800'
+                        }`}
+                      >
+                        A4 Sticker Grid
+                      </button>
+                      <button 
+                        onClick={() => setLabelLayout('continuous')}
+                        className={`py-2 px-3 rounded-lg text-xs font-bold uppercase border transition-all ${
+                          labelLayout === 'continuous' 
+                            ? 'bg-emerald-600 text-white border-emerald-600 dark:bg-emerald-500' 
+                            : 'bg-white dark:bg-slate-900 text-slate-600 border-slate-200 dark:border-slate-800'
+                        }`}
+                      >
+                        Baris Thermal
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Preset Size */}
+                  {/* Preset Size */}
+                  <div className="space-y-2">
+                    <label className="text-[10px] font-black text-slate-600 dark:text-slate-400 uppercase tracking-wider block">Ukuran Stiker Lapangan</label>
+                    <select 
+                      value={labelSize}
+                      onChange={(e) => setLabelSize(e.target.value as any)}
+                      className="w-full bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-2.5 rounded-lg text-xs font-bold text-slate-700 dark:text-white outline-none"
+                    >
+                      <option value="sm">KECIL (40 x 20 mm)</option>
+                      <option value="md">STANDAR MUTASI (50 x 30 mm)</option>
+                      <option value="lg">BESAR PERALATAN (70 x 40 mm)</option>
+                    </select>
+                  </div>
+
+                  {/* QR Code Sizing Scale Slider */}
+                  <div className="space-y-2 bg-emerald-500/5 dark:bg-emerald-500/5 p-3.5 rounded-xl border border-emerald-500/10 dark:border-emerald-500/15">
+                    <div className="flex justify-between items-center text-[10px] font-black text-slate-600 dark:text-slate-400 uppercase tracking-wider">
+                      <span>Skala QR Code & Barcode</span>
+                      <span className="text-emerald-600 dark:text-emerald-400 font-mono font-black text-[11px] bg-emerald-100 dark:bg-emerald-950/50 px-2 py-0.5 rounded border border-emerald-200 dark:border-emerald-800/65">{Math.round(labelQrScale * 100)}%</span>
+                    </div>
+                    <input 
+                      type="range" 
+                      min="0.5" 
+                      max="1.2" 
+                      step="0.05" 
+                      value={labelQrScale} 
+                      onChange={(e) => setLabelQrScale(parseFloat(e.target.value))}
+                      className="w-full accent-emerald-500 dark:accent-emerald-400 cursor-pointer h-1.5 bg-slate-200 dark:bg-slate-800 rounded-lg appearance-none"
+                    />
+                    <div className="flex justify-between text-[8px] text-slate-400 font-bold uppercase tracking-wider">
+                      <span>Ekstrim (50%)</span>
+                      <span>Biasa (100%)</span>
+                    </div>
+                    <p className="text-[9px] text-slate-500 dark:text-slate-400 italic leading-snug font-medium pt-1">
+                      💡 Direkomendasikan skala <strong className="text-emerald-600 dark:text-emerald-400 font-bold">70% s.d. 85%</strong> untuk ukuran minimalis yang sangat ringkas namun tetap instan di-scan oleh kamera HP & barcode scanner lapangan.
+                    </p>
+                  </div>
+
+                  {/* Visibility Controls */}
+                  <div className="space-y-3 pt-2">
+                    <p className="text-[10px] font-black text-slate-600 dark:text-slate-400 uppercase tracking-wider border-b border-slate-200 dark:border-slate-800 pb-1">Detail Konten Stiker</p>
+                    
+                    <label className="flex items-center gap-2.5 cursor-pointer select-none">
+                      <input 
+                        type="checkbox" 
+                        checked={labelShowName} 
+                        onChange={(e) => setLabelShowName(e.target.checked)}
+                        className="rounded text-emerald-500 focus:ring-emerald-500 w-4 h-4 bg-white dark:bg-slate-900 border-slate-300 dark:border-slate-800"
+                      />
+                      <span className="text-xs font-bold text-slate-700 dark:text-slate-300 uppercase">Nama Aset</span>
+                    </label>
+
+                    <label className="flex items-center gap-2.5 cursor-pointer select-none">
+                      <input 
+                        type="checkbox" 
+                        checked={labelShowSKU} 
+                        onChange={(e) => setLabelShowSKU(e.target.checked)}
+                        className="rounded text-emerald-500 focus:ring-emerald-500 w-4 h-4 bg-white dark:bg-slate-900 border-slate-300 dark:border-slate-800"
+                      />
+                      <span className="text-xs font-bold text-slate-700 dark:text-slate-300 uppercase">Barcode SKU</span>
+                    </label>
+
+                    <label className="flex items-center gap-2.5 cursor-pointer select-none">
+                      <input 
+                        type="checkbox" 
+                        checked={labelShowSerial} 
+                        onChange={(e) => setLabelShowSerial(e.target.checked)}
+                        className="rounded text-emerald-500 focus:ring-emerald-500 w-4 h-4 bg-white dark:bg-slate-900 border-slate-300 dark:border-slate-800"
+                      />
+                      <span className="text-xs font-bold text-slate-700 dark:text-slate-300 uppercase">Nomor Seri (SN)</span>
+                    </label>
+
+                    <label className="flex items-center gap-2.5 cursor-pointer select-none">
+                      <input 
+                        type="checkbox" 
+                        checked={labelShowPopor} 
+                        onChange={(e) => setLabelShowPopor(e.target.checked)}
+                        className="rounded text-emerald-500 focus:ring-emerald-500 w-4 h-4 bg-white dark:bg-slate-900 border-slate-300 dark:border-slate-800"
+                      />
+                      <span className="text-xs font-bold text-slate-700 dark:text-slate-300 uppercase">Nomor Popor / Rak</span>
+                    </label>
+
+                    <label className="flex items-center gap-2.5 cursor-pointer select-none">
+                      <input 
+                        type="checkbox" 
+                        checked={labelShowCategory} 
+                        onChange={(e) => setLabelShowCategory(e.target.checked)}
+                        className="rounded text-emerald-500 focus:ring-emerald-500 w-4 h-4 bg-white dark:bg-slate-900 border-slate-300 dark:border-slate-800"
+                      />
+                      <span className="text-xs font-bold text-[#10b981] dark:text-emerald-400 uppercase">Tampilkan Kategori</span>
+                    </label>
+                  </div>
+
+                  <div className="bg-emerald-500/10 p-3 rounded-lg border border-emerald-500/20 text-[10px] text-emerald-600 dark:text-emerald-400 font-bold leading-relaxed">
+                    💡 Tips lapangan: Atur margin cetak ke "None" / "Minimum" pada browser untuk kecocokan ukuran stiker yang presisi.
+                  </div>
+                </div>
+
+                {/* Right Side: Interactive Preview Grid */}
+                <div className="flex-1 p-6 overflow-y-auto bg-slate-100 dark:bg-[#030712] relative flex flex-col items-center">
+                  <p className="text-[10px] font-black text-slate-500 uppercase tracking-widest mb-4">PREVIEW LAYOUT CETAK FISIK</p>
+                  
+                  {/* Label Canvas Preview */}
+                  <div className={`w-full max-w-xl bg-white text-black p-6 border shadow-inner ${
+                    labelLayout === 'grid' 
+                      ? 'aspect-[1/1.41] border-slate-300 rounded shadow-md' 
+                      : 'border-dashed border-orange-500/50 rounded-md min-h-[300px]'
+                  }`} style={{ fontFamily: 'monospace' }}>
+                    
+                    {labelLayout === 'grid' && <p className="text-[8px] text-slate-400 border-b border-slate-100 pb-1 mb-3 text-center">[ PRINTER GRID PREVIEW FORMAT: A4 SHEET ]</p>}
+                    {labelLayout === 'continuous' && <p className="text-[8px] text-orange-400 border-b border-dashed border-orange-200 pb-1 mb-3 text-center">[ THERMAL LABEL ROLL CONTINUOUS PREVIEW ]</p>}
+                    
+                    <div className={`flex flex-wrap gap-2.5 justify-center ${
+                      labelLayout === 'grid' 
+                        ? 'grid grid-cols-2' 
+                        : 'flex flex-col items-center'
+                    }`}>
+                      {inventory
+                        .filter(i => selectedItems.includes(i.id))
+                        .slice(0, 8) 
+                        .map(item => {
+                          const isMinimalOnly = !labelShowName && !labelShowCategory && !labelShowSerial && !labelShowPopor;
+                          let baseWidth = isMinimalOnly ? 115 : 195;
+                          let defaultQrSize = 36;
+                          let defaultBarcodeHeight = 22;
+                          let defaultBarcodeWidth = 1.0;
+
+                          if (labelSize === 'sm') {
+                            baseWidth = isMinimalOnly ? 90 : 145;
+                            defaultQrSize = 24;
+                            defaultBarcodeHeight = 14;
+                            defaultBarcodeWidth = 0.65;
+                          } else if (labelSize === 'lg') {
+                            baseWidth = isMinimalOnly ? 160 : 250;
+                            defaultQrSize = 48;
+                            defaultBarcodeHeight = 30;
+                            defaultBarcodeWidth = 1.35;
+                          }
+
+                          const computedWidth = Math.round(baseWidth * labelQrScale);
+                          const qrSize = Math.round(defaultQrSize * labelQrScale);
+                          const barcodeHeight = Math.round(defaultBarcodeHeight * labelQrScale);
+                          const barcodeWidth = parseFloat((defaultBarcodeWidth * labelQrScale).toFixed(2));
+
+                          const hasDetailsUnder = labelShowCategory || (labelShowSerial && item.serial !== '-') || (labelShowPopor && item.popor !== '-');
+                          const showMetaFooter = labelShowName || hasDetailsUnder;
+
+                          return (
+                            <div 
+                              key={item.id} 
+                              className="border border-dashed border-slate-400 flex flex-col justify-center p-1 text-left bg-white leading-tight shadow-sm text-black"
+                              style={{ width: `${computedWidth}px`, margin: '3px' }}
+                            >
+                              {labelShowName && (
+                                <div 
+                                  className="font-black uppercase border-b border-black pb-0.5 mb-1 text-center bg-slate-50 w-full truncate text-ellipsis"
+                                  style={{ fontSize: `${Math.max(6, Math.round(10 * labelQrScale))}px` }}
+                                >
+                                  {item.name}
+                                </div>
+                              )}
+                              
+                              <div className="flex items-center gap-0.5 px-0.5 w-full justify-center overflow-hidden">
+                                <div className="shrink-0 flex items-center justify-center p-0 border border-black/5 rounded bg-white">
+                                  <QRCodeSVG value={item.id} size={qrSize} includeMargin={false} />
+                                </div>
+
+                                {labelShowSKU && (
+                                  <div className="shrink-0 flex flex-col items-center justify-center overflow-hidden ml-1">
+                                      <Barcode 
+                                        value={item.id} 
+                                        width={barcodeWidth} 
+                                        height={barcodeHeight} 
+                                        fontSize={Math.max(5, Math.round(7 * labelQrScale))} 
+                                        textPosition="bottom" 
+                                        margin={0} 
+                                        background="transparent" 
+                                        lineColor="#000000" 
+                                        displayValue={true} 
+                                        renderer="svg"
+                                        format="CODE128"
+                                      />
+                                  </div>
+                                )}
+                              </div>
+
+                              {hasDetailsUnder && (
+                                <div 
+                                  className="w-full mt-1 border-t border-black/10 pt-1 text-left font-mono leading-tight space-y-0.5" 
+                                  style={{ fontSize: `${Math.max(5, Math.round(8 * labelQrScale))}px` }}
+                                >
+                                  {labelShowCategory && <div className="opacity-60 uppercase truncate">CAT: {item.category}</div>}
+                                  {labelShowSerial && item.serial !== '-' && <div className="opacity-60 truncate">SN: {item.serial}</div>}
+                                  {labelShowPopor && item.popor !== '-' && <div className="opacity-60 truncate font-extrabold text-emerald-800">PO: {item.popor}</div>}
+                                </div>
+                              )}
+                              
+                              {showMetaFooter && (
+                                <div 
+                                  className="mt-1 flex justify-between items-center opacity-40 font-mono border-t border-black/5 pt-0.5"
+                                  style={{ fontSize: `${Math.max(4, Math.round(6 * labelQrScale))}px` }}
+                                >
+                                  <span>GUDANG LOGISTIK</span>
+                                  <span>{labelSize === 'sm' ? '4x2cm' : labelSize === 'lg' ? '7x4cm' : '5x3cm'}</span>
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                    </div>
+                    {selectedItems.length > 8 && (
+                      <p className="text-[9px] text-center text-slate-550 italic mt-4 font-mono">... dan {selectedItems.length - 8} stiker lainnya akan dicetak penuh.</p>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {/* Footer Bar */}
+              <div className="p-6 border-t border-slate-200 dark:border-slate-800 shrink-0 bg-slate-50 dark:bg-[#050b14]/90 flex flex-col sm:flex-row justify-between items-center gap-4">
+                <div className="text-left">
+                  <span className="text-[10px] font-black text-slate-500 uppercase tracking-wider block">Estimasi Media Cetak:</span>
+                  <span className="text-xs font-bold text-slate-700 dark:text-slate-300">
+                    {labelLayout === 'grid' 
+                      ? `Membutuhkan ~${Math.ceil(selectedItems.length / (labelSize === 'sm' ? 24 : labelSize === 'lg' ? 10 : 16))} Lembar Kertas Stiker A4 Grid`
+                      : `Akan dicetak continuous sebanyak ${selectedItems.length} lembar label rolthermal`}
+                  </span>
+                </div>
+                
+                <div className="flex gap-2 w-full sm:w-auto">
+                  <button 
+                    onClick={() => {
+                      const isCompact = labelSize === 'sm' || labelSize === 'md';
+                      handlePrint({
+                        type: 'inventory-selection',
+                        ids: selectedItems,
+                        compact: isCompact,
+                        layout: labelLayout,
+                        customStudio: {
+                          size: labelSize,
+                          showName: labelShowName,
+                          showSKU: labelShowSKU,
+                          showSerial: labelShowSerial,
+                          showPopor: labelShowPopor,
+                          showCategory: labelShowCategory,
+                          qrScale: labelQrScale
+                        }
+                      });
+                    }}
+                    className="flex-1 sm:flex-none btn-interact bg-emerald-600 hover:bg-emerald-500 text-slate-950 dark:text-white px-8 py-3.5 rounded-xl text-xs font-black uppercase tracking-widest flex items-center justify-center gap-2"
+                  >
+                    <Printer size={16} /> CETAK SEKARANG ({selectedItems.length} LABEL)
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Unified Overdue Dialog Modal */}
         <AnimatePresence>
           {showOverdueModal && inventory.filter(i => i.status === 'Keluar' && i.dueDate && Date.now() > i.dueDate).length > 0 && (
@@ -3735,6 +5242,7 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
       </main>
     </div>
     </div>
+    </MotionConfig>
   );
 }
 

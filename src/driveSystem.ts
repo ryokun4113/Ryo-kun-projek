@@ -60,3 +60,18 @@ export const restoreFromDrive = async (fileId: string) => {
     const data = await res.json();
     return data;
 };
+
+export const deleteFileFromDrive = async (fileId: string) => {
+    const accessToken = await getAccessToken();
+    if (!accessToken) throw new Error('Not authenticated with Google');
+  
+    const res = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}`, {
+      method: 'DELETE',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+      },
+    });
+  
+    if (!res.ok) throw new Error('Failed to delete file from Google Drive');
+    return true;
+};

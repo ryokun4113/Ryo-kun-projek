@@ -94,10 +94,8 @@ export function JarvisAssistant({ logs, inventory, isOnline, currentUser }: Jarv
         let feedText = "";
         if (log.type === "OUT") {
           feedText = `[SCAN OUT] ${log.name} -> PEMEGANG: ${log.holder || "UNKNOWN"}`;
-          triggerVoiceAnnouncement(`Aset ${log.name} terdeteksi dikeluarkan oleh ${log.holder}.`);
         } else if (log.type === "IN") {
           feedText = `[SCAN IN] ${log.name} -> DI GUDANG`;
-          triggerVoiceAnnouncement(`Aset ${log.name} telah berhasil dikembalikan ke gudang.`);
         } else if (log.type === "ADD") {
           feedText = `[NEW REG] ${log.name} SKU: ${log.id}`;
         } else if (log.type === "EDIT") {
