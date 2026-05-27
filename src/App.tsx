@@ -13,7 +13,7 @@ import {
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from "recharts";
 import Barcode from 'react-barcode';
 import { QRCodeSVG } from "qrcode.react";
-import { collection, doc, setDoc, deleteDoc, onSnapshot, query, orderBy, writeBatch, getDocs, where } from "firebase/firestore";
+import { collection, doc, setDoc, getDoc, deleteDoc, onSnapshot, query, orderBy, writeBatch, getDocs, where, getDocsFromCache, getDocsFromServer } from "firebase/firestore";
 import { db } from "./firebase";
 import { motion, AnimatePresence, MotionConfig } from "motion/react";
 import { AuthScreen } from "./AuthScreen";
@@ -176,10 +176,28 @@ export default function App() {
     if (navigator.onLine) {
       try {
         const batch = writeBatch(db);
-        if (action === 'ADD' || action === 'EDIT' || action === 'MUTATION') {
-          if (item) {
-            batch.set(doc(db, "items", item.id), item);
+        if (action === 'MUTATION' && item) {
+          const docRef = doc(db, "items", item.id);
+          const docSnap = await getDoc(docRef);
+          let finalItem = item;
+          if (docSnap.exists()) {
+            const existingItem = docSnap.data();
+            // PROTEKSI MUTASI (DIKUNCI)
+            // Kunci semua field data barang / aslinya (nama, kategori, serial, popor, holder, keterangan, tanggal registrasi)
+            // Hanya perbarui status keluar ("Keluar" / "Di Gudang"), outTimestamp, dan dueDate.
+            finalItem = {
+              ...existingItem,
+              status: item.status,
+              outTimestamp: item.outTimestamp !== undefined ? item.outTimestamp : (existingItem.outTimestamp || null),
+              dueDate: item.dueDate !== undefined ? item.dueDate : (existingItem.dueDate || null),
+            };
           }
+          batch.set(docRef, finalItem);
+          if (log) {
+            batch.set(doc(collection(db, "logs")), log);
+          }
+        } else if ((action === 'ADD' || action === 'EDIT') && item) {
+          batch.set(doc(db, "items", item.id), item);
           if (log) {
             batch.set(doc(collection(db, "logs")), log);
           }
@@ -224,10 +242,25 @@ export default function App() {
       for (const t of queueToProcess) {
         try {
           const batch = writeBatch(db);
-          if (t.action === 'ADD' || t.action === 'EDIT' || t.action === 'MUTATION') {
-            if (t.item) {
-              batch.set(doc(db, "items", t.item.id), t.item);
+          if (t.action === 'MUTATION' && t.item) {
+            const docRef = doc(db, "items", t.item.id);
+            const docSnap = await getDoc(docRef);
+            let finalItem = t.item;
+            if (docSnap.exists()) {
+              const existingItem = docSnap.data();
+              finalItem = {
+                ...existingItem,
+                status: t.item.status,
+                outTimestamp: t.item.outTimestamp !== undefined ? t.item.outTimestamp : (existingItem.outTimestamp || null),
+                dueDate: t.item.dueDate !== undefined ? t.item.dueDate : (existingItem.dueDate || null),
+              };
             }
+            batch.set(docRef, finalItem);
+            if (t.log) {
+              batch.set(doc(collection(db, "logs")), t.log);
+            }
+          } else if ((t.action === 'ADD' || t.action === 'EDIT') && t.item) {
+            batch.set(doc(db, "items", t.item.id), t.item);
             if (t.log) {
               batch.set(doc(collection(db, "logs")), t.log);
             }
@@ -594,6 +627,9 @@ export default function App() {
   const excelInputRef = useRef<HTMLInputElement>(null);
   const notifiedOverdueRef = useRef<Set<string>>(new Set());
   const lastScanRef = useRef<{ code: string; timestamp: number }>({ code: "", timestamp: 0 });
+  const scanBufferRef = useRef<string>("");
+  const lastKeyTimeRef = useRef<number>(0);
+  const scannerTimeoutRef = useRef<any>(null);
 
   useEffect(() => {
     const overdueItems = inventory.filter(i => i.status === 'Keluar' && i.dueDate && Date.now() > i.dueDate);
@@ -732,6 +768,77 @@ export default function App() {
     return () => clearInterval(timer);
   }, []);
 
+  // FITUR: Tarik database dari Firebase & Google Sheets (Fallback) saat pertama kali buka
+  useEffect(() => {
+    const fetchDatabaseStartup = async () => {
+      try {
+        console.log("[Db Startup] Menarik database aset (Cache first)...");
+        const itemsColl = collection(db, "items");
+        
+        let snapshot: any = null;
+        try {
+          snapshot = await getDocsFromCache(itemsColl);
+          console.log("[Db Startup] Mencoba menarik data dari Cache lokal...");
+        } catch (cacheErr) {
+          console.log("[Db Startup] Data cache belum tersedia atau kosong, mencoba ke cloud server...", cacheErr);
+        }
+
+        // Jika data cache kosong atau gagal ditarik, hubungi server cloud dengan batas waktu (timeout) 4 detik
+        if (!snapshot || snapshot.empty) {
+          if (navigator.onLine) {
+            console.log("[Db Startup] Cache kosong dan perangkat terhubung internet. Menghubungi Firestore cloud...");
+            
+            // Promise pembatas waktu (4 detik timeout)
+            const timeoutPromise = new Promise((_, reject) => 
+              setTimeout(() => reject(new Error("Timeout")), 4000)
+            );
+            
+            try {
+              snapshot = await Promise.race([
+                getDocsFromServer(itemsColl),
+                timeoutPromise
+              ]) as any;
+            } catch (serverErr: any) {
+              console.warn("[Db Startup] Gagal mengambil dari Firestore cloud atau batas waktu habis (Server lambat / offline).");
+            }
+          } else {
+            console.log("[Db Startup] Perangkat offline, menunda sinkronisasi server.");
+          }
+        }
+        
+        if (snapshot && !snapshot.empty) {
+          const itemsData = snapshot.docs.map((doc: any) => doc.data() as Item);
+          setInventory(itemsData);
+          console.log(`[Db Startup] Berhasil memuat ${itemsData.length} aset dari Firebase.`);
+        } else {
+          // Hanya tarik Google Sheets jika data snapshot terkonfirmasi kosong (artinya database baru/kosong)
+          if (snapshot && snapshot.empty) {
+            console.warn("[Db Startup] Database Firebase kosong! Membaca konfigurasi Google Sheets...");
+            const storedSpreadsheetId = safeStorage.getItem("sheets_spreadsheet_id");
+            if (storedSpreadsheetId) {
+              console.log(`[Db Startup] Spreadsheet ID ditemukan: ${storedSpreadsheetId}. Menarik data otomatis...`);
+              const sheetsItems = await pullDataFromSpreadsheet(storedSpreadsheetId);
+              if (sheetsItems && sheetsItems.length > 0) {
+                console.log(`[Db Startup] Ditemukan ${sheetsItems.length} aset di Google Sheets. Menyimpan ke Firebase...`);
+                const batch = writeBatch(db);
+                for (const item of sheetsItems) {
+                  batch.set(doc(db, "items", item.id), item);
+                }
+                await batch.commit();
+                setInventory(sheetsItems);
+                console.log("[Db Startup] Sinkronisasi awal berhasil diisi dari Google Sheets.");
+              }
+            }
+          }
+        }
+      } catch (err) {
+        console.error("[Db Startup] Gagal memuat database saat startup:", err);
+      }
+    };
+    
+    fetchDatabaseStartup();
+  }, []);
+
   const formatTimeString = (date: Date) => {
     return date.toLocaleTimeString('id-ID', { hour12: false });
   };
@@ -847,26 +954,36 @@ export default function App() {
         console.warn("SpeechSynthesis cancel error:", e);
       }
 
+      /* 
+         !!! FITUR MUTASI PENTING (DIKUNCI) !!!
+         DILARANG MENGUBAH ATAU RE-STYLISASI FORMAT SUARA DI BAWAH INI. 
+         Format ini disetting khusus sesuai standard operasional Batalyon B Pelopor:
+         - SCAN OUT: [Nama Aset] atas nama [Peminjam] no popor [No Popor] telah keluar gudang
+         - SCAN IN : [Nama Aset] atas nama [Peminjam] nomor popor [No Popor] telah kembali ke gudang
+      */
       const holderText = item.holder && item.holder !== "-" && item.holder !== "" ? item.holder : 'KOSONG';
-      const holderPart = `ATAS NAMA ${holderText}`;
-      
-      const hasPopor = item.popor && item.popor !== "-" && item.popor !== "";
-      const poporPart = hasPopor ? `NO POPOR ${item.popor}` : "";
+      const poporText = item.popor && item.popor !== "-" && item.popor !== "" ? item.popor : "";
       
       let announcement = "";
       if (isOut) {
-          announcement = `${item.name}, ${holderPart}, ${poporPart ? poporPart + ', ' : ''}TELAH KELUAR GUDANG`;
+          announcement = `${item.name} atas nama ${holderText} ${poporText ? `no popor ${poporText} ` : ''}telah keluar gudang`;
       } else {
-          announcement = `${item.name}, ${holderPart}, ${poporPart ? poporPart + ', ' : ''}TELAH KEMBALI KE GUDANG`;
+          announcement = `${item.name} atas nama ${holderText} ${poporText ? `nomor popor ${poporText} ` : ''}telah kembali ke gudang`;
       }
 
-      // 50ms pause lets browser engines complete internal state reset successfully 
+      // 100ms pause lets browser engines complete internal state reset successfully 
       setTimeout(() => {
         try {
           const msg = new SpeechSynthesisUtterance(announcement);
           msg.lang = 'id-ID';
-          msg.rate = 0.9;
+          msg.rate = 0.95;
           msg.pitch = 1;
+
+          // Garbage Collection Guard - Simpan ke global array agar tidak dibersihkan oleh Garbage Collector saat berbicara
+          if (!(window as any)._activeUtterances) {
+            (window as any)._activeUtterances = [];
+          }
+          (window as any)._activeUtterances.push(msg);
           
           // Force fallback to Indonesian voice if the browser has it loaded
           if (window.speechSynthesis.getVoices) {
@@ -876,12 +993,46 @@ export default function App() {
               msg.voice = idVoice;
             }
           }
+
+          let keepAliveInterval: any = null;
+
+          const cleanUpSpeech = () => {
+            if (keepAliveInterval) {
+              clearInterval(keepAliveInterval);
+              keepAliveInterval = null;
+            }
+            if ((window as any)._activeUtterances) {
+              (window as any)._activeUtterances = (window as any)._activeUtterances.filter((u: any) => u !== msg);
+            }
+          };
+
+          msg.onend = () => {
+            cleanUpSpeech();
+          };
+
+          msg.onerror = () => {
+            cleanUpSpeech();
+          };
           
+          if (window.speechSynthesis.paused) {
+            window.speechSynthesis.resume();
+          }
           window.speechSynthesis.speak(msg);
+
+          // Trik resume berkala jika Browser mengalami timeout setelah 15 detik transmisi
+          keepAliveInterval = setInterval(() => {
+            if (window.speechSynthesis.speaking && !window.speechSynthesis.paused) {
+              window.speechSynthesis.pause();
+              window.speechSynthesis.resume();
+            } else {
+              cleanUpSpeech();
+            }
+          }, 10000);
+
         } catch (err) {
           console.error("SpeechSynthesis speak execution error:", err);
         }
-      }, 50);
+      }, 100);
     }
   };
 
@@ -1077,6 +1228,25 @@ export default function App() {
             const utterance = new SpeechSynthesisUtterance("ASET TIDAK DITEMUKAN");
             utterance.lang = 'id-ID';
             utterance.rate = 1.0;
+            
+            // Garbage Collection Guard - Simpan ke global array agar tidak dibersihkan oleh Garbage Collector saat berbicara
+            if (!(window as any)._activeUtterances) {
+              (window as any)._activeUtterances = [];
+            }
+            (window as any)._activeUtterances.push(utterance);
+
+            utterance.onend = () => {
+              if ((window as any)._activeUtterances) {
+                (window as any)._activeUtterances = (window as any)._activeUtterances.filter((u: any) => u !== utterance);
+              }
+            };
+
+            utterance.onerror = () => {
+              if ((window as any)._activeUtterances) {
+                (window as any)._activeUtterances = (window as any)._activeUtterances.filter((u: any) => u !== utterance);
+              }
+            };
+
             window.speechSynthesis.speak(utterance);
          }
       } catch (err) {
@@ -1161,18 +1331,35 @@ export default function App() {
     setOpnameSession(updated);
   };
   
+  // Synchronize dynamic values to refs to avoid tearing down/re-registering the keyboard listener on every re-render
+  const activeTabRef = useRef(activeTab);
+  const opnameSessionRef = useRef(opnameSession);
+  const handleScanCodeRef = useRef(handleScanCode);
+  const handleOpnameScanRef = useRef(handleOpnameScan);
+
+  useEffect(() => {
+    activeTabRef.current = activeTab;
+    opnameSessionRef.current = opnameSession;
+    handleScanCodeRef.current = handleScanCode;
+    handleOpnameScanRef.current = handleOpnameScan;
+  }, [activeTab, opnameSession, handleScanCode, handleOpnameScan]);
+  
   // Handler Keystroke Global untuk Pemindai Scanner Fisik / Gun Barcode
   useEffect(() => {
-    let buffer = "";
-    let lastKeyTime = Date.now();
-
     const handleGlobalKeyDown = (e: KeyboardEvent) => {
-      // 1. Jika fokus sedang berada di kolom teks (input/textarea) biasa, jangan interupsi ketikan pengguna
-      const activeEl = document.activeElement;
+      // Selalu batalkan timeout sebelumnya di awal event keydown apa pun
+      if (scannerTimeoutRef.current) {
+        clearTimeout(scannerTimeoutRef.current);
+        scannerTimeoutRef.current = null;
+      }
+
+      const activeEl = document.activeElement as HTMLElement | null;
+
+      // 1. Jika fokus berada di kolom input / textarea mana pun, biarkan browser menangani ketikan secara alami
       if (activeEl && (
         activeEl.tagName === 'INPUT' || 
         activeEl.tagName === 'TEXTAREA' || 
-        (activeEl as HTMLElement).isContentEditable
+        activeEl.isContentEditable
       )) {
         return;
       }
@@ -1183,43 +1370,89 @@ export default function App() {
       }
 
       const now = Date.now();
-      // Reset buffer jika jeda pengetikan melebihi 600ms (biasanya input dari tembakan scanner sangat instan < 50ms)
-      if (now - lastKeyTime > 600) {
-        buffer = "";
+      // Reset buffer jika jeda pengetikan melebihi 400ms (biasanya input dari tembakan scanner sangat instan < 50ms per key)
+      if (now - lastKeyTimeRef.current > 400) {
+        scanBufferRef.current = "";
       }
-      lastKeyTime = now;
+      lastKeyTimeRef.current = now;
 
       // Sebagian besar unit scanner fisik mengirimkan tombol 'Enter' (Carriage Return) sebagai penutup scan
       if (e.key === 'Enter') {
-        const cleanedCode = buffer.trim();
-        if (cleanedCode.length >= 2) {
+        const cleanedCode = scanBufferRef.current.trim();
+        const codeToSend = cleanedCode.endsWith('.') ? cleanedCode.slice(0, -1).trim() : cleanedCode;
+
+        if (codeToSend.length >= 1) {
           e.preventDefault();
           
           // Jika operator sedang membuka tab Stock Opname Aktif, arahkan input langsung ke stock opname
-          if (activeTab === 'opname' && opnameSession?.active) {
-            handleOpnameScan(cleanedCode);
+          if (activeTabRef.current === 'opname' && opnameSessionRef.current?.active) {
+            handleOpnameScanRef.current(codeToSend);
           } else {
             // Pengalihan otomatis ke Menu/Tab Scanner utama
             setActiveTab('scanner');
-            setScanInput(cleanedCode);
-            handleScanCode(cleanedCode);
+            setScanInput(codeToSend);
+            handleScanCodeRef.current(codeToSend);
           }
-          buffer = "";
         }
+        scanBufferRef.current = "";
         return;
       }
 
       // Hanya tampung karakter tunggal yang valid/printable
       if (e.key.length === 1) {
-        buffer += e.key;
+        scanBufferRef.current += e.key;
+
+        // Pendeteksian Suffix '.' (titik) sebagai penutup scan
+        if (scanBufferRef.current.endsWith('.')) {
+          const codeToSend = scanBufferRef.current.slice(0, -1).trim();
+          if (codeToSend.length >= 1) {
+            e.preventDefault();
+            
+            // Jika operator sedang membuka tab Stock Opname Aktif, arahkan input langsung ke stock opname
+            if (activeTabRef.current === 'opname' && opnameSessionRef.current?.active) {
+              handleOpnameScanRef.current(codeToSend);
+            } else {
+              // Pengalihan otomatis ke Menu/Tab Scanner utama
+              setActiveTab('scanner');
+              setScanInput(codeToSend);
+              handleScanCodeRef.current(codeToSend);
+            }
+          }
+          scanBufferRef.current = "";
+          return;
+        }
+      }
+
+      // Setup timeout-based auto-submission HANYA jika buffer tidak kosong
+      if (scanBufferRef.current.trim().length > 0) {
+        scannerTimeoutRef.current = setTimeout(() => {
+          const cleanedCode = scanBufferRef.current.trim();
+          const codeToSend = cleanedCode.endsWith('.') ? cleanedCode.slice(0, -1).trim() : cleanedCode;
+
+          if (codeToSend.length >= 1) {
+            // Jika operator sedang membuka tab Stock Opname Aktif, arahkan input langsung ke stock opname
+            if (activeTabRef.current === 'opname' && opnameSessionRef.current?.active) {
+              handleOpnameScanRef.current(codeToSend);
+            } else {
+              // Pengalihan otomatis ke Menu/Tab Scanner utama
+              setActiveTab('scanner');
+              setScanInput(codeToSend);
+              handleScanCodeRef.current(codeToSend);
+            }
+          }
+          scanBufferRef.current = "";
+        }, 180);
       }
     };
 
     window.addEventListener('keydown', handleGlobalKeyDown);
     return () => {
       window.removeEventListener('keydown', handleGlobalKeyDown);
+      if (scannerTimeoutRef.current) {
+        clearTimeout(scannerTimeoutRef.current);
+      }
     };
-  }, [activeTab, opnameSession, handleScanCode, handleOpnameScan]);
+  }, []);
   
   const handleExportExcel = () => {
     const toExport = inventory.filter(item => selectedItems.length === 0 || selectedItems.includes(item.id));
@@ -1755,37 +1988,87 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
   };
 
   useEffect(() => {
-    let scanner: Html5QrcodeScanner | null = null;
     let timer: any = null;
-    
+    let activeScannerInstance: any = null;
+    let isCurrent = true;
+
+    const stopActiveScanner = async (scannerToStop: any) => {
+      if (!scannerToStop) return;
+      try {
+        if (typeof scannerToStop.clear === 'function') {
+          await scannerToStop.clear();
+        } else if (typeof scannerToStop.stop === 'function') {
+          await scannerToStop.stop();
+        }
+      } catch (err) {
+        console.warn("[Scanner Cleanup] Warning while clearing scanner:", err);
+      } finally {
+        const container = document.getElementById("reader");
+        if (container) container.innerHTML = "";
+      }
+    };
+
     if (cameraActive) {
-      timer = setTimeout(() => {
+      timer = setTimeout(async () => {
         try {
-          if (!document.getElementById("reader")) return;
-          scanner = new Html5QrcodeScanner(
+          if (!isCurrent) return;
+          const container = document.getElementById("reader");
+          if (!container) return;
+
+          // If there's an already running global scanner, stop it first to prevent lock error
+          if ((window as any).__activeScanner) {
+            console.log("[Scanner] Stopping stale global scanner instance...");
+            await stopActiveScanner((window as any).__activeScanner);
+            (window as any).__activeScanner = null;
+          }
+
+          container.innerHTML = ""; // clean slate
+
+          console.log("[Scanner] Initializing Html5QrcodeScanner...");
+          const newScanner = new Html5QrcodeScanner(
             "reader",
-            { fps: 10, qrbox: { width: 250, height: 250 } },
+            { 
+              fps: 15, 
+              qrbox: { width: 250, height: 250 },
+              rememberLastUsedCamera: true
+            },
             false
           );
-          scanner.render(
+
+          if (!isCurrent) {
+            await stopActiveScanner(newScanner);
+            return;
+          }
+
+          (window as any).__activeScanner = newScanner;
+          activeScannerInstance = newScanner;
+
+          newScanner.render(
             (decodedText) => {
-              handleScanCode(decodedText);
-              setCameraActive(false);
+              if (isCurrent) {
+                handleScanCode(decodedText);
+                setCameraActive(false);
+              }
             },
             (error) => {
-              // ignore error to keep scanning
+              // ignore scan failures
             }
           );
         } catch (err) {
-          console.error("Failed to start Html5QrcodeScanner:", err);
+          console.error("Gagal memulai kamera Html5QrcodeScanner:", err);
         }
-      }, 100);
+      }, 200);
     }
-    
+
     return () => {
+      isCurrent = false;
       if (timer) clearTimeout(timer);
-      if (scanner) {
-        scanner.clear().catch((error) => console.error("Failed to clear scanner", error));
+      if (activeScannerInstance) {
+        stopActiveScanner(activeScannerInstance).then(() => {
+          if ((window as any).__activeScanner === activeScannerInstance) {
+            (window as any).__activeScanner = null;
+          }
+        });
       }
     };
   }, [cameraActive]);
@@ -2214,6 +2497,12 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                       } ({printContext.sort === 'asc' ? 'TERLAMA KE TERBARU' : 'TERBARU KE TERLAMA'})
                     </h2>
 
+                    {sessionNameInput && (
+                      <div className="text-[9px] print:text-[8px] font-bold uppercase mb-2 bg-slate-100 dark:bg-slate-800 p-2 border border-black/10 rounded tracking-wider text-slate-800 dark:text-slate-200">
+                        SESI OPERASIONAL UTAMA: <span className="underline decoration-dotted text-black dark:text-white font-black">{sessionNameInput}</span>
+                      </div>
+                    )}
+
                     <h3 className="text-[9px] print:text-[8px] font-black uppercase mt-2 mb-1 text-red-600 tracking-wider">BAGIAN 1: ASET YANG MASIH DI LUAR GUDANG (BELUM KEMBALI / MERAH)</h3>
                     <table className="w-full text-left text-[7px] print:text-[8px] leading-tight mb-3 print:mb-2 border-collapse">
                       <thead className="border-b-[1.5px] border-black font-black bg-red-50">
@@ -2225,6 +2514,7 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                           <th className="py-1 px-1 print:py-0.5">NAMA ASET</th>
                           <th className="py-1 px-1 print:py-0.5">NO. POPOR</th>
                           <th className="py-1 px-1 print:py-0.5">NO. SERI</th>
+                          <th className="py-1 px-1 print:py-0.5">SESI / KEGIATAN</th>
                           <th className="py-1 px-1 print:py-0.5">STATUS</th>
                           <th className="py-1 px-1 print:py-0.5">PEMEGANG SAAT INI</th>
                           <th className="py-1 px-1 print:py-0.5">OP</th>
@@ -2248,6 +2538,7 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                             <td className="py-1 px-1 print:py-0.5 font-black">{log.name}</td>
                             <td className="py-1 px-1 print:py-0.5 font-black">{itemInfo?.popor || '-'}</td>
                             <td className="py-1 px-1 print:py-0.5">{itemInfo?.serial || '-'}</td>
+                            <td className="py-1 px-1 print:py-0.5 uppercase max-w-[110px] truncate text-slate-800 dark:text-slate-200">{log.sessionName || '-'}</td>
                             <td className="py-1 px-1 print:py-0.5 uppercase">{log.status}</td>
                             <td className="py-1 px-1 print:py-0.5 truncate max-w-[150px]">{log.holder || '-'}</td>
                             <td className="py-1 px-1 print:py-0.5">{log.operator}</td>
@@ -2255,7 +2546,7 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                           );
                         })}
                         {sortedLogsStillOut.length === 0 && (
-                           <tr><td colSpan={10} className="text-center py-2 font-bold border-b border-black text-slate-500 text-[8px] print:text-[8px]">SELURUH ASET YANG KELUAR SUDAH KEMBALI KE GUDANG.</td></tr>
+                           <tr><td colSpan={11} className="text-center py-2 font-bold border-b border-black text-slate-500 text-[8px] print:text-[8px]">SELURUH ASET YANG KELUAR SUDAH KEMBALI KE GUDANG.</td></tr>
                         )}
                       </tbody>
                     </table>
@@ -2271,6 +2562,7 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                           <th className="py-1 px-1 print:py-0.5">NAMA ASET</th>
                           <th className="py-1 px-1 print:py-0.5">NO. POPOR</th>
                           <th className="py-1 px-1 print:py-0.5">NO. SERI</th>
+                          <th className="py-1 px-1 print:py-0.5">SESI / KEGIATAN</th>
                           <th className="py-1 px-1 print:py-0.5">STATUS LOG</th>
                           <th className="py-1 px-1 print:py-0.5">PEMEGANG / KET</th>
                           <th className="py-1 px-1 print:py-0.5">OP</th>
@@ -2294,6 +2586,7 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                             <td className="py-0.5 px-1 print:py-0.5 font-black">{log.name}</td>
                             <td className="py-0.5 px-1 print:py-0.5 font-bold text-slate-800">{itemInfo?.popor || '-'}</td>
                             <td className="py-0.5 px-1 print:py-0.5 text-slate-600">{itemInfo?.serial || '-'}</td>
+                            <td className="py-0.5 px-1 print:py-0.5 uppercase max-w-[110px] truncate text-slate-600">{log.sessionName || '-'}</td>
                             <td className="py-0.5 px-1 print:py-0.5 uppercase">{log.status}</td>
                             <td className="py-0.5 px-1 print:py-0.5 truncate max-w-[150px]">{log.holder || '-'}</td>
                             <td className="py-0.5 px-1 print:py-0.5">{log.operator}</td>
@@ -2301,7 +2594,7 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                           );
                         })}
                         {sortedLogsInsideOrOther.length === 0 && (
-                             <tr><td colSpan={10} className="text-center py-2 font-bold border-b border-black text-slate-500 text-[8px] print:text-[8px]">TIDAK ADA DATA LOG MUTASI LAINNYA.</td></tr>
+                             <tr><td colSpan={11} className="text-center py-2 font-bold border-b border-black text-slate-500 text-[8px] print:text-[8px]">TIDAK ADA DATA LOG MUTASI LAINNYA.</td></tr>
                         )}
                       </tbody>
                     </table>
@@ -2923,10 +3216,37 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                   <p className="text-[9px] text-emerald-500 font-bold uppercase tracking-wider mt-1">Mendukung Scan QR Code, SKU Link URL, dan Barcode Inventaris</p>
               </div>
 
+              {/* Sesi Operasional Panel */}
+              <div className="bg-gradient-to-r from-emerald-600/5 to-emerald-600/10 dark:from-emerald-950/10 dark:to-emerald-950/20 border-2 border-emerald-500/20 rounded-[20px] p-5 shadow-sm dark:shadow-none animate-in fade-in zoom-in-95 duration-300">
+                  <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
+                      <div className="flex-1 space-y-1">
+                          <label className="text-[10px] md:text-xs font-black text-emerald-600 dark:text-emerald-400 uppercase tracking-widest flex items-center gap-1.5">
+                              <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
+                              SESI / KEGIATAN OPERASIONAL AKTIF
+                          </label>
+                          <p className="text-[10px] text-slate-500 dark:text-slate-400 uppercase font-semibold">
+                              Nama kegiatan di bawah ini otomatis akan tersimpan pada setiap histori log serta dicetak pada mutasi cetak.
+                          </p>
+                      </div>
+                      <div className="w-full md:w-2/3">
+                          <input 
+                              type="text"
+                              value={sessionNameInput}
+                              onChange={(e) => setSessionNameInput(e.target.value)}
+                              placeholder="CONTOH: LATIHAN MENEMBAK REAKSI, PENJAGAAN..."
+                              className="w-full px-4 py-3 bg-white dark:bg-slate-900 border-2 border-slate-300/80 dark:border-slate-800 text-slate-900 dark:text-slate-100 placeholder-slate-400 dark:placeholder-slate-500 text-xs font-mono font-bold uppercase rounded-lg focus:border-emerald-500 dark:focus:border-emerald-500 outline-none transition-all shadow-inner tracking-wider"
+                          />
+                      </div>
+                  </div>
+              </div>
+
               {/* Manual Input Container */}
               <form onSubmit={(e) => {
                   e.preventDefault();
-                  handleScanCode(scanInput);
+                  const val = scanInput.trim().replace(/[\r\n\t]/g, '');
+                  if (val) {
+                    handleScanCode(val);
+                  }
                   setScanInput("");
               }}>
                 <div className={`glass-effect rounded-[30px] border border-slate-300 dark:border-slate-700 p-2 focus-within:border-emerald-500 relative overflow-hidden bg-white dark:bg-[#020617] hud-card shadow-sm dark:shadow-none transition-all duration-300 ${
@@ -2952,10 +3272,24 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                       onChange={(e) => {
                         const val = e.target.value;
                         if (val.endsWith('.')) {
-                          handleScanCode(val.slice(0, -1));
+                          const cleanVal = val.slice(0, -1).trim();
+                          if (cleanVal) {
+                            handleScanCode(cleanVal);
+                          }
                           setScanInput("");
                         } else {
-                          setScanInput(val);
+                          const cleanVal = val.replace(/[\r\n\t]/g, '');
+                          setScanInput(cleanVal);
+                        }
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          e.preventDefault();
+                          const val = e.currentTarget.value.trim().replace(/[\r\n\t]/g, '');
+                          if (val) {
+                            handleScanCode(val);
+                            setScanInput("");
+                          }
                         }
                       }}
                       className="w-full bg-white dark:bg-[#020617] p-8 rounded-[24px] text-xl font-mono font-bold text-emerald-500 dark:text-emerald-400 outline-none text-center uppercase tracking-widest relative z-20 shadow-sm dark:shadow-none" 
@@ -3102,7 +3436,7 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                       </div>
                     </div>
                   )}
-                <div id="reader" className="w-full mx-auto overflow-hidden rounded-[16px] mb-4" />
+                 <div id="reader" className="w-full mx-auto overflow-hidden rounded-[16px] mb-4" />
                 <button 
                   onClick={() => setCameraActive(false)}
                   className="bg-red-900/50 text-red-500 px-6 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest hover:bg-red-600 hover:text-slate-900 dark:text-white border border-red-500/50"
@@ -4760,7 +5094,41 @@ Seluruh data saat ini akan TERTUMPUK dan DIGANTIKAN!!`)) return;
                                     </button>
                                  </div>
 
-                                 {/* BOT NOTIFIKASI EMAIL */}
+                                 {/* PENGATURAN & PERBAIKAN DIAGNOSTIK SUARA TTS */}
+                                  <div className="border border-slate-200 dark:border-slate-800 rounded-2xl overflow-hidden bg-slate-50 dark:bg-[#020617]/50 p-5 mt-6 space-y-4 text-left font-sans">
+                                     <div className="flex items-center justify-between border-b border-slate-200 dark:border-slate-800 pb-3">
+                                        <div className="flex items-center gap-2">
+                                           <Cpu size={16} className="text-amber-500" />
+                                           <h3 className="text-xs font-black uppercase text-slate-800 dark:text-white tracking-widest text-left">Pelayanan Suara Mutasi (TTS)</h3>
+                                        </div>
+                                     </div>
+                                     <p className="text-[10px] font-bold text-slate-500 leading-relaxed">
+                                        Jika suara pembaca mutasi tiba-tiba tidak berbunyi, browser Anda mungkin menangguhkan sistem text-to-speech. Klik tombol di bawah untuk menyegarkan dan melepaskan kuncian suara secara instan.
+                                     </p>
+                                     <button 
+                                        onClick={() => {
+                                           try {
+                                              window.speechSynthesis.cancel();
+                                              if (window.speechSynthesis.paused) {
+                                                 window.speechSynthesis.resume();
+                                              }
+                                              const testMsg = new SpeechSynthesisUtterance("Sistem pengeras suara berhasil dipulihkan");
+                                              testMsg.lang = "id-ID";
+                                              testMsg.rate = 0.95;
+                                              window.speechSynthesis.speak(testMsg);
+                                              alert("Sistem suara mutasi berhasil direstart dan dibebaskan dari kuncian browser!");
+                                           } catch (err) {
+                                              console.error(err);
+                                              alert("Gagal merestart engine suara.");
+                                           }
+                                        }}
+                                        className="w-full px-3 py-3 bg-amber-600 hover:bg-amber-500 text-white rounded-xl text-[10px] font-black uppercase tracking-widest shadow-[0_2px_10px_rgba(245,158,11,0.15)] transition-colors text-center block font-sans"
+                                     >
+                                        Restart Engine Suara (TTS)
+                                     </button>
+                                  </div>
+
+                                  {/* BOT NOTIFIKASI EMAIL */}
                                  <div className="border border-slate-200 dark:border-slate-800 rounded-2xl overflow-hidden bg-slate-50 dark:bg-[#020617]/50 p-5 mt-6 space-y-4 text-left">
                                     <div className="flex items-center justify-between border-b border-slate-200 dark:border-slate-800 pb-3">
                                        <div className="flex items-center gap-2">

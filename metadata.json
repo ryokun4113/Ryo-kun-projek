@@ -1,6 +1,6 @@
 {
   "name": "Sistem Manajemen Gudang Senjata Batalyon B Pelopor",
   "description": "Sistem Manajemen Gudang Senjata Batalyon B Pelopor - Developed by RYO KUN",
-  "requestFramePermissions": [],
+  "requestFramePermissions": ["camera"],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }
